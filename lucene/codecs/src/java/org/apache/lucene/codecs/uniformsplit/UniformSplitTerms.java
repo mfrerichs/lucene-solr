@@ -47,7 +47,7 @@ public class UniformSplitTerms extends Terms implements Accountable {
   protected final FieldMetadata fieldMetadata;
   protected final PostingsReaderBase postingsReader;
   protected final BlockDecoder blockDecoder;
-  protected final IndexDictionary.BrowserSupplier dictionaryBrowserSupplier;
+  protected final IndexDictionary.Supplier dictionarySupplier;
 
   /**
    * @param blockDecoder Optional block decoder, may be null if none. It can be used for decompression or decryption.
@@ -55,7 +55,7 @@ public class UniformSplitTerms extends Terms implements Accountable {
   protected UniformSplitTerms(IndexInput dictionaryInput, IndexInput blockInput, FieldMetadata fieldMetadata,
                     PostingsReaderBase postingsReader, BlockDecoder blockDecoder) throws IOException {
     this(blockInput, fieldMetadata, postingsReader, blockDecoder,
-        new FSTDictionary.BrowserSupplier(dictionaryInput, fieldMetadata.getDictionaryStartFP(), blockDecoder));
+        new FSTDictionary.Supplier(dictionaryInput, fieldMetadata.getDictionaryStartFP(), blockDecoder));
   }
 
   /**
@@ -63,27 +63,30 @@ public class UniformSplitTerms extends Terms implements Accountable {
    */
   protected UniformSplitTerms(IndexInput blockInput, FieldMetadata fieldMetadata,
                               PostingsReaderBase postingsReader, BlockDecoder blockDecoder,
-                              IndexDictionary.BrowserSupplier dictionaryBrowserSupplier) {
+                              IndexDictionary.Supplier dictionarySupplier) {
     assert fieldMetadata != null;
     assert fieldMetadata.getFieldInfo() != null;
     assert fieldMetadata.getLastTerm() != null;
-    assert dictionaryBrowserSupplier != null;
+    assert dictionarySupplier != null;
     this.blockInput = blockInput;
     this.fieldMetadata = fieldMetadata;
     this.postingsReader = postingsReader;
     this.blockDecoder = blockDecoder;
-    this.dictionaryBrowserSupplier = dictionaryBrowserSupplier;
+    this.dictionarySupplier = dictionarySupplier;
   }
 
   @Override
   public TermsEnum iterator() throws IOException {
-    return new BlockReader(dictionaryBrowserSupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
+    return new BlockReader(dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
   }
 
   @Override
   public TermsEnum intersect(CompiledAutomaton compiled, BytesRef startTerm) throws IOException {
-    checkIntersectAutomatonType(compiled);
-    return new IntersectBlockReader(compiled, startTerm, dictionaryBrowserSupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
+    if (dictionarySupplier instanceof FSTDictionary.Supplier) {
+      checkIntersectAutomatonType(compiled);
+      return new IntersectBlockReader(compiled, startTerm, (FSTDictionary.Supplier) dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
+    }
+    return super.intersect(compiled, startTerm);
   }
 
   protected void checkIntersectAutomatonType(CompiledAutomaton automaton) {
@@ -148,6 +151,6 @@ public class UniformSplitTerms extends Terms implements Accountable {
   }
 
   public long getDictionaryRamBytesUsed() {
-    return dictionaryBrowserSupplier.ramBytesUsed();
+    return dictionarySupplier.ramBytesUsed();
   }
 }

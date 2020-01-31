@@ -18,260 +18,596 @@
 package org.apache.lucene.codecs.uniformsplit;
 
 import java.io.IOException;
-import java.util.Objects;
 
 import org.apache.lucene.codecs.PostingsReaderBase;
 import org.apache.lucene.index.TermState;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.BytesRefBuilder;
-import org.apache.lucene.util.IntsRefBuilder;
-import org.apache.lucene.util.StringHelper;
+import org.apache.lucene.util.RamUsageEstimator;
 import org.apache.lucene.util.automaton.Automaton;
 import org.apache.lucene.util.automaton.ByteRunAutomaton;
 import org.apache.lucene.util.automaton.CompiledAutomaton;
-import org.apache.lucene.util.automaton.Operations;
 import org.apache.lucene.util.automaton.Transition;
+import org.apache.lucene.util.fst.FST;
+import org.apache.lucene.util.fst.Outputs;
 
 /**
  * The "intersect" {@link TermsEnum} response to {@link UniformSplitTerms#intersect(CompiledAutomaton, BytesRef)},
  * intersecting the terms with an automaton.
+ *
+ * @lucene.experimental
  */
 public class IntersectBlockReader extends BlockReader {
 
-  protected final AutomatonNextTermCalculator nextStringCalculator;
-  protected final ByteRunAutomaton runAutomaton;
-  protected final BytesRef commonSuffixRef; // maybe null
-  protected final BytesRef commonPrefixRef;
-  protected final BytesRef startTerm; // maybe null
+  private static final int AUTOMATON_INITIAL_STATE = 0;
+  private static final BytesRef EMPTY_BYTES_REF = new BytesRef();
+  private static final BytesRef ZERO_BYTES_REF = new BytesRef(new byte[] {0}, 0, 1);
 
-  /** Set this when our current mode is seeking to this term.  Set to null after. */
-  protected BytesRef seekTerm;
+  //public static boolean debug = false;
+  private static final boolean UTF8_TO_STRING = true;
 
-  protected int blockPrefixRunAutomatonState;
-  protected int blockPrefixLen;
+  private final Automaton automaton;
+  private final ByteRunAutomaton runAutomaton;
+  private final FST<Long> fst;
+  private final FST.BytesReader fstReader;
+  private final Outputs<Long> outputs;
 
-  /**
-   * Number of bytes accepted by the last call to {@link #runAutomatonForState}.
-   */
-  protected int numBytesAccepted;
-  /**
-   * Whether the current term is beyond the automaton common prefix.
-   * If true this means the enumeration should stop immediately.
-   */
-  protected boolean beyondCommonPrefix;
+  private Node[] branchNodes;
+  private int branchDepth;
+  private final MatchResult matchResult;
+  private boolean shouldScanBlock;
+  private boolean scanPreviousBlock;
+  private long endBlockFP;
+  private int[] matchStates;
+  private int matchIndex;
+  private int commonPrefixIndex;
+  private final FST.Arc<Long> lastSkippedArc;
+  private Long lastSkippedArcOutput;
+  private final FST.Arc<Long> scratchArc;
+  private boolean returnStartTermOnce;
+  private boolean firstBlockOpened;
 
   public IntersectBlockReader(CompiledAutomaton compiled, BytesRef startTerm,
-                              IndexDictionary.BrowserSupplier dictionaryBrowserSupplier, IndexInput blockInput, PostingsReaderBase postingsReader,
+                              FSTDictionary.Supplier dictionarySupplier, IndexInput blockInput, PostingsReaderBase postingsReader,
                               FieldMetadata fieldMetadata, BlockDecoder blockDecoder) throws IOException {
-    super(dictionaryBrowserSupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
-    this.nextStringCalculator = new AutomatonNextTermCalculator(compiled);
-    Automaton automaton = Objects.requireNonNull(compiled.automaton);
-    this.runAutomaton = Objects.requireNonNull(compiled.runAutomaton);
-    this.commonSuffixRef = compiled.commonSuffixRef; // maybe null
-    this.commonPrefixRef = Operations.getCommonPrefixBytesRef(automaton); // never null
+    super(dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
 
-    this.startTerm = startTerm;
-    assert startTerm == null || StringHelper.startsWith(startTerm, commonPrefixRef);
-    // it is thus also true that startTerm >= commonPrefixRef
-
-    this.seekTerm = startTerm != null ? startTerm : commonPrefixRef;
+    this.automaton = compiled.automaton;
+    runAutomaton = compiled.runAutomaton;
+    fst = dictionarySupplier.get().fst;
+    fstReader = fst.getBytesReader();
+    outputs = fst.outputs;
+    branchNodes = new Node[16];
+    branchDepth = -1;
+    matchResult = new MatchResult();
+    endBlockFP = -1;
+    matchStates = new int[32];
+    lastSkippedArc = new FST.Arc<>();
+    scratchArc = new FST.Arc<>();
+    //if (debug) System.out.println("new " + IntersectBlockReader.class.getSimpleName());
+    Node root = stackNode().asRoot();
+    boolean startAtFirstTerm = root.transitionCount > 0 && runAutomaton.isAccept(root.transition.source);
+    if (startTerm != null || startAtFirstTerm) {
+      seekStartTerm(startTerm);
+    }
   }
 
   @Override
   public BytesRef next() throws IOException {
     clearTermState();
 
-    if (blockHeader == null) { // initial state
-      // note: don't call super.seekCeil here; we have our own logic
+    nodeLoop:
+    while (true) {
 
-      // Set the browser position to the block having the seek term.
-      // Even if -1, it's okay since we'll soon call nextKey().
-      long blockStartFP = getOrCreateDictionaryBrowser().seekBlock(seekTerm);
-      if (isBeyondLastTerm(seekTerm, blockStartFP)) {
-        return null; // EOF
+      // If we are currently scanning a term block, continue scanning.
+      if (shouldScanBlock) {
+        BytesRef term = findNextMatchingTermInBlock();
+        if (term != null) {
+          return term;
+        }
+        shouldScanBlock = false;
       }
 
-      // Starting at this block find and load the next matching block.
-      //   note: Since seekBlock was just called, we actually consider the current block as "next".
-      if (nextBlockMatchingPrefix() == false) { // note: starts at seek'ed block, which may have a match
-        return null; // EOF
-      }
-    }
-
-    do {
-
-      // look in the rest of this block.
-      BytesRef term = nextTermInBlockMatching();
-      if (term != null) {
-        return term;
-      }
-
-      // next term dict matching prefix
-    } while (nextBlockMatchingPrefix());
-
-    return null; // EOF
-  }
-
-  /**
-   * Find the next block that appears to contain terms that could match the automata.
-   * The prefix is the primary clue.  Returns true if at one, or false for no more (EOF).
-   */
-  protected boolean nextBlockMatchingPrefix() throws IOException {
-    if (beyondCommonPrefix) {
-      return false; // EOF
-    }
-
-    IndexDictionary.Browser browser = getOrCreateDictionaryBrowser();
-
-    do {
-
-      // Get next block key (becomes in effect the current blockKey)
-      BytesRef blockKey = browser.nextKey();
-      if (blockKey == null) {
-        return false; // EOF
+      // Pop from the stack the nodes with exhausted arc or transition iteration.
+      Node node = getCurrentNode();
+      while (true) {
+        if (node.isArcIterationOver()) {
+          //if (debug) System.out.println("pop node [" + node.depth + "]");
+          node = popNode();
+          if (node == null) {
+            // End of enumeration.
+            return null;
+          }
+        } else if (node.isTransitionIterationOver()) {
+          if (followRemainingArcs(node)) {
+            continue nodeLoop;
+          }
+        } else {
+          break;
+        }
       }
 
-      blockPrefixLen = browser.getBlockPrefixLen();
-      blockPrefixRunAutomatonState = runAutomatonForState(blockKey.bytes, blockKey.offset, blockPrefixLen, 0);
-
-      // We may have passed commonPrefix  (a short-circuit optimization).
-      if (isBeyondCommonPrefix(blockKey)) {
-        return false; // EOF
-      }
-
-      if (blockPrefixRunAutomatonState >= 0) {
-        break; // a match
-      }
-
-      //
-      // This block doesn't match.
-      //
-
-      seekTerm = null; // we're moving on to another block, and seekTerm is before it.
-
-      // Should we simply get the next key (linear mode) or try to seek?
-      if (nextStringCalculator.isLinearState(blockKey)) {
+      // If we only need to scan the floor and/or ceil term blocks of the sub-branch.
+      if (node.onlyFloorOrCeil) {
+        followFloorOrCeilArcs(node);
         continue;
       }
 
-      // Maybe the next block's key matches?  We have to check this before calling nextStringCalculator.
-      BytesRef peekKey = browser.peekKey();
-      if (peekKey == null) {
-        return false; // EOF
+      // Iterate the FST arcs of the current node (the top node in the stack).
+      do {
+        if (iterateMatchingTransitions(node)) {
+          followArc(node);
+          break;
+        }
+        //if (debug) System.out.println("[" + node.depth + "] no transitions match arc " + node.toString(node.arc));
+        if (node.isTransitionIterationOver()) {
+          //if (debug) System.out.println("[" + node.depth + "] no more transitions");
+          break;
+        }
+        recordLastSkippedArc(node);
+      } while (node.nextArc());
+    }
+  }
+
+  private enum SeekStartOption {REGULAR, AT_FIRST_TERM, AFTER_EMPTY_TERM}
+
+  private void seekStartTerm(BytesRef startTerm) throws IOException {
+    SeekStartOption seekStartOption;
+    if (startTerm == null) {
+      seekStartOption = SeekStartOption.AT_FIRST_TERM;
+      startTerm = ZERO_BYTES_REF;
+    } else if (startTerm.length == 0) {
+      seekStartOption = SeekStartOption.AFTER_EMPTY_TERM;
+      startTerm = ZERO_BYTES_REF;
+    } else {
+      seekStartOption = SeekStartOption.REGULAR;
+    }
+    //if (debug) System.out.println("seek start term \"" + (UTF8_TO_STRING ? startTerm.utf8ToString() : startTerm) + "\"" + (seekStartOption == SeekStartOption.REGULAR ? "" : " " + seekStartOption));
+    Node node = getCurrentNode();
+    int startTermIndex = startTerm.offset;
+    int startTermEnd = startTerm.offset + startTerm.length;
+    while (true) {
+      assert branchDepth == startTermIndex - startTerm.offset;
+      assert node == getCurrentNode();
+
+      if (node.arc.label() == FST.END_LABEL && node.isLastArc()) {
+        // Open the term block.
+        node.nextArc();
+        assert node.isArcIterationOver();
+        long blockFP = outputs.add(node.output, node.arc.output());
+        findStartTermInBlock(node, blockFP, startTerm, seekStartOption);
+        return;
       }
-      if (runAutomatonForState(peekKey.bytes, peekKey.offset, peekKey.length, 0) >= 0) {
-        continue; // yay; it matched.  Continue to actually advance to it.  This is rare?
+      int startTermLabel = startTerm.bytes[startTermIndex] & 0xFF;
+      if (fst.findTargetArc(startTermLabel, node.followArc, node.arc, fstReader) == null) {
+        // No match. Find floor block.
+        break;
       }
-
-      // Seek to a block by calculating the next term to match the automata *following* peekKey.
-      this.seekTerm = nextStringCalculator.nextSeekTerm(browser.peekKey());
-      if (seekTerm == null) {
-        return false; // EOF
+      // Match. Follow the arc.
+      node.setNextArc(false);
+      int destState = node.setTransitionForLabel(startTermLabel);
+      if (destState == -1) {
+        if (seekStartOption == SeekStartOption.REGULAR) {
+          throw new IllegalArgumentException("startTerm \"" + (UTF8_TO_STRING ? startTerm.utf8ToString() : startTerm) + "\" must be accepted by the automaton");
+        } else {
+          destState = node.transition.dest;
+        }
       }
-      browser.seekBlock(seekTerm);
-      //continue
+      boolean ceilMatch = node.isLastArc() && node.requiresCeilMatch
+          || node.transition.max > startTermLabel
+          || node.nextTransition() && (node.isLastArc() || node.transition.min < node.nextArc.label());
+      matchResult.reset(destState, false, ceilMatch);
+      Node nextNode = stackNode().follow(node, matchResult);
+      node.nextArc(); // Prepare the next arc when later the node is poped.
+      node = nextNode;
+      if (++startTermIndex == startTermEnd) {
+        // End of the start term but the FST branch is longer. Find floor block.
+        // Create an artificial start term by appending a 0 suffix.
+        // This will match a final floor arc on the node if there is one.
+        byte[] bytes = new byte[startTerm.length + 1];
+        System.arraycopy(startTerm.bytes, startTerm.offset, bytes, 0, startTerm.length);
+        startTerm = new BytesRef(bytes, 0, bytes.length);
+        break;
+      }
+    }
+    // Find floor block.
+    while (node != null) {
+      assert branchDepth == startTermIndex - startTerm.offset;
+      assert node == getCurrentNode();
 
-    } while (true); // while not a match
+      // Find backward the first node with first arc label < start term label.
+      int startTermLabel = startTerm.bytes[startTermIndex] & 0xFF;
+      fst.readFirstTargetArc(node.followArc, node.arc, fstReader);
+      if (node.arc.label() < startTermLabel) {
+        // Then find the max arc with label < start term label.
+        boolean isFirstArc = true;
+        while (!node.isLastArc() && fst.readNextArcLabel(node.arc, fstReader) < startTermLabel) {
+          fst.readNextArc(node.arc, fstReader);
+          isFirstArc = false;
+        }
+        node.setNextArc(isFirstArc);
+        if (startTermIndex != startTermEnd && seekStartOption == SeekStartOption.REGULAR) { // Skip artificial 0 suffix or 0 byte for special option.
+          node.setTransitionForLabel(startTermLabel);
+        }
+        // Then follow the ceil arcs to open the term block.
+        long ceilBlockFP = getCeilBlockFP(scratchArc.copyFrom(node.arc), node.output);
+        node.nextArc(); // Prepare the next arc when later the node is poped.
+        findStartTermInBlock(node, ceilBlockFP, startTerm, seekStartOption);
+        return;
+      }
+      node = popNode();
+      startTermIndex--;
+    }
+    //if (debug) System.out.println("start term before first");
+    stackNode().asRoot();
+  }
 
-    // A match!
+  private void findStartTermInBlock(Node node, long blockFP, BytesRef startTerm, SeekStartOption seekStartOption) throws IOException {
+    if (seekStartOption == SeekStartOption.AT_FIRST_TERM) {
+        startTerm = EMPTY_BYTES_REF;
+    }
+    SeekStatus seekStatus = seekInBlock(startTerm, blockFP);
+    //if (debug) System.out.println("seek in block FP=" + blockFP + " status=" + seekStatus);
+    switch (seekStatus) {
+      case FOUND:
+        if (seekStartOption != SeekStartOption.REGULAR) {
+          // For SeekStartOption.AT_FIRST_TERM we searched [] so we have to return it once.
+          // For SeekStartOption.AFTER_EMPTY_TERM we searched [0] so we have to return it once.
+          returnStartTermOnce = true;
+        }
+        break;
+      case NOT_FOUND:
+        BytesRef term = term();
+        if (runAutomaton.run(term.bytes, term.offset, term.length)) {
+          // The block line is positioned on the next term which is accepted by the automaton, so we have to return it once.
+          returnStartTermOnce = true;
+        }
+        //if (debug) System.out.println("positioned on term \"" + term.utf8ToString() + "\"" + (returnStartTermOnce ? " return start term once" : ""));
+        break;
+      case END:
+        return;
+      default:
+        throw new IllegalStateException("Unsupported " + SeekStatus.class.getSimpleName() + " " + seekStatus);
+    }
+    shouldScanBlock = true;
+    this.endBlockFP = blockFP;
+    setCommonPrefix(node);
+  }
 
-    //NOTE: we could determine if this automata has a prefix for this specific block (longer than the commonPrefix).
-    //  If we see it, we could set it as the seekTerm and we could also exit the block early if we get past this prefix
-    //  and runAutomatonFromPrefix would start from this prefix.  Smiley tried but benchmarks were not favorable to it.
+  private BytesRef findNextMatchingTermInBlock() throws IOException {
+    assert blockHeader != null;
+    if (returnStartTermOnce) {
+      returnStartTermOnce = false;
+      return term();
+    }
+    termLoop:
+    while (true) {
+      if (readLineInBlock() == null) {
+        // No more line in the block.
+        matchIndex = 0;
+        long blockFP = blockInput.getFilePointer();
+        if (blockFP > endBlockFP) {
+          // Exit either if we completed the single block to read, or the last block of the series.
+          scanPreviousBlock = false;
+          //if (debug) System.out.println("end of block");
+          return null;
+        }
+        if (scanPreviousBlock) {
+          scanPreviousBlock = false;
+          setCommonPrefix(getCurrentNode());
+        }
+        // Scan the next block starting at the current file pointer in the block file.
+        //if (debug) System.out.println("open next block FP=" + blockFP);
+        initializeHeader(null, blockFP);
+        if (blockHeader == null) {
+          throw newCorruptIndexException("Illegal absence of block", blockFP);
+        }
+        readLineInBlock();
+      }
+      TermBytes termBytes = blockLine.getTermBytes();
+      BytesRef term = termBytes.term;
+      assert term.offset == 0;
+      matchIndex = Math.max(Math.min(termBytes.getSuffixOffset(), matchIndex), commonPrefixIndex);
+      int state = matchStates[matchIndex];
+      while (matchIndex < term.length) {
+        state = runAutomaton.step(state, term.bytes[matchIndex] & 0xff);
+        if (state == -1) {
+          // No match.
+          assert !runAutomaton.run(term.bytes, term.offset, term.length) : term + " is rejected although the automaton accepts it";
+          //if (debug) System.out.println("reject \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
+          continue termLoop;
+        }
+        if (++matchIndex == matchStates.length) {
+          matchStates = ArrayUtil.growExact(matchStates, ArrayUtil.oversize(matchStates.length + 1, Byte.BYTES));
+        }
+        matchStates[matchIndex] = state;
+      }
+      if (runAutomaton.isAccept(state)) {
+        // Match.
+        assert runAutomaton.run(term.bytes, term.offset, term.length) : term + " is accepted although the automaton rejects it";
+        //if (debug) System.out.println("accept \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
+        return term;
+      }
+      // No match.
+      assert !runAutomaton.run(term.bytes, term.offset, term.length) : term + " is rejected although the automaton accepts it";
+      //if (debug) System.out.println("reject \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
+    }
+  }
 
-    initializeHeader(null, browser.getBlockFilePointer());
+  private boolean iterateMatchingTransitions(Node node) {
+    assert !node.isArcIterationOver() && !node.isTransitionIterationOver();
+    int arcLabel = node.arc.label();
+    int nextArcLabel;
+    boolean ceilMatch;
+    if (node.isLastArc()) {
+      nextArcLabel = Integer.MAX_VALUE;
+      ceilMatch = node.requiresCeilMatch;
+    } else {
+      nextArcLabel = node.nextArc.label();
+      ceilMatch = false;
+    }
+    //if (debug) System.out.println("[" + node.depth + "] iterate arc=" + node.toString(node.arc) + " nextArc=" + (nextArcLabel == Integer.MAX_VALUE ? "-" : node.toString(node.nextArc)));
 
+    // Special case of no transitions which can accept a first final arc and floor match.
+    if (node.drainNoTransitionState()) {
+      //if (debug) System.out.println("node has no transition");
+      return matchResult.reset(-1, node.isFirstArc(), ceilMatch);
+    }
+    boolean floorMatchFirstArc = node.requiresFloorMatch;
+    boolean destinationAccepted = runAutomaton.isAccept(node.transition.dest);
+
+    // Skip all transitions before the arc label.
+    while (node.transition.max < arcLabel) {
+      floorMatchFirstArc = true;
+      if (!node.nextTransition()) {
+        //if (debug) System.out.println("skipped all transitions");
+        return matchResult.reset(-1, destinationAccepted || node.isFirstArc(), ceilMatch);
+      }
+      destinationAccepted |= runAutomaton.isAccept(node.transition.dest);
+    }
+
+    // Iterate the transitions matching this arc.
+    // Find if there is:
+    // - A transition matching exactly the arc label (transition.min <= arcLabel <= transition.max).
+    // - One or more transitions ceil matching the arc (transition.min < nextArcLabel && transition.max > arcLabel).
+    int exactMatchState = -1;
+    int min;
+    while ((min = node.transition.min) < nextArcLabel) {
+      if (min <= arcLabel) {
+        exactMatchState = node.transition.dest;
+        if (min < arcLabel) {
+          floorMatchFirstArc = true;
+        }
+        if (ceilMatch || node.transition.max > arcLabel) {
+          if (exactMatchState == node.transition.source && min == 0 && node.transition.max == 255) {
+            // Special case of wildcard suffix detected (e.g. PrefixQuery automaton).
+            return matchResult.resetForWildcard(floorMatchFirstArc);
+          }
+          ceilMatch = true;
+          break;
+        }
+      } else {
+        ceilMatch = true;
+        break;
+      }
+      if (!node.nextTransition()) {
+        break;
+      }
+      destinationAccepted |= runAutomaton.isAccept(node.transition.dest);
+    }
+    boolean floorMatch = destinationAccepted || floorMatchFirstArc && node.isFirstArc();
+    return matchResult.reset(exactMatchState, floorMatch, ceilMatch);
+  }
+
+  /**
+   * Follows the current {@link FST.Arc} of the provided node and advances the matching {@link Transition}
+   * in case of exact match. Either stacks a new non-final node, or opens a term block for scanning (final node).
+   * Also prepares the next arc of the current node, to continue the iteration from it when we finish the visit of
+   * the stacked node / block scan.
+   */
+  private void followArc(Node node) throws IOException {
+    if (node.arc.label() == FST.END_LABEL) {
+      // Final node. Open the corresponding term block to prepare to scan it.
+      //if (debug) System.out.println("[" + node.depth + "] follow final arc");
+      long blockFP = outputs.add(node.output, node.arc.output());
+      openBlocks(node, maybePreviousBlockFP(node, blockFP), blockFP);
+      node.nextArc(); // Continue the iteration from the next arc when we pop back this node from the stack.
+    } else if (matchResult.wildcardSuffix) {
+      //if (debug) System.out.println("[" + node.depth + "] follow wildcard suffix");
+      matchResult.wildcardSuffix = false;
+      node.requiresFloorMatch = matchResult.floorMatch;
+      node.requiresCeilMatch = false;
+      openAllSubBlocks(node);
+      node.exhaustArcIteration(); // Exhaust this node arcs (no remaining arcs to follow/skip).
+    } else {
+      // Non-leaf node. Advance deeper in the FST tree, stack the child node.
+      //if (debug) System.out.println("[" + node.depth + "] follow " + node.toString(node.arc) + " " + matchResult + " node.output=" + node.output + " arc.output=" + node.arc.output());
+      stackNode().follow(node, matchResult);
+      node.nextArc(); // Continue the iteration from the next arc when we pop back this node from the stack.
+    }
+  }
+
+  private boolean followRemainingArcs(Node node) throws IOException {
+    //if (debug) System.out.println("[" + node.depth + "] follow remaining arcs");
+    boolean followed = false;
+    boolean floorMatch = node.requiresFloorMatch && !node.onlyFloorOrCeil && node.isFirstArc();
+    if (floorMatch && !node.requiresCeilMatch) {
+      // The iteration is on the first arc. Follow the floor arcs directly without reading the first arc again.
+      followFloorArcs(node, true);
+      followed = true;
+    }
+    node.jumpToLastArc();
+    if (node.requiresCeilMatch) {
+      if (floorMatch) {
+        // Both floor and ceil blocks are needed. Stack a fake node to trigger that.
+        matchResult.reset(-1, true, true);
+        stackNode().follow(node, matchResult);
+      } else {
+        // The iteration is on the last arc. Follow the ceil arcs directly without reading the ceil arc again.
+        followCeilArcs(node, true);
+      }
+      followed = true;
+    } else {
+      recordLastSkippedArc(node);
+    }
+    node.nextArc();
+    assert node.isArcIterationOver(); // This exhausted node will be poped from the stack.
+    return followed;
+  }
+
+  private void recordLastSkippedArc(Node node) {
+    //if (debug) System.out.println("[" + node.depth + "] record skipped arc " + node.toString(node.arc) + " node.output=" + node.output + " arc.output=" + node.arc.output());
+    lastSkippedArc.copyFrom(node.arc);
+    lastSkippedArcOutput = node.output;
+  }
+
+  private void followFloorOrCeilArcs(Node node) throws IOException {
+    assert node.requiresFloorMatch || node.requiresCeilMatch;
+    if (node.requiresFloorMatch) {
+      followFloorArcs(node, false);
+      if (node.requiresCeilMatch) {
+        node.requiresFloorMatch = false;
+        return;
+      }
+      node.nextTransition(); // Exhaust this node transitions (may have remaining ceil arc to follow/skip).
+      assert node.isTransitionIterationOver();
+    } else {
+      followCeilArcs(node, false);
+      node.exhaustArcIteration(); // Exhaust this node arcs (no remaining arcs to follow/skip).
+    }
+  }
+
+  private void followFloorArcs(Node node, boolean isAlreadyOnFirstArc) throws IOException {
+    assert !isAlreadyOnFirstArc || node.isFirstArc();
+    //if (debug) System.out.println("[" + node.depth + "] follow floor arcs");
+    if (isAlreadyOnFirstArc) {
+      scratchArc.copyFrom(node.arc);
+    } else {
+      fst.readFirstTargetArc(node.followArc, scratchArc, fstReader);
+    }
+    openPreviousBlock(node, getFloorBlockFP(scratchArc, node.output));
+  }
+
+  private void followCeilArcs(Node node, boolean isAlreadyOnLastArc) throws IOException {
+    assert !isAlreadyOnLastArc || node.isLastArc();
+    //if (debug) System.out.println("[" + node.depth + "] follow ceil arcs");
+    if (isAlreadyOnLastArc) {
+      scratchArc.copyFrom(node.arc);
+    } else {
+      fst.readLastTargetArc(node.followArc, scratchArc, fstReader);
+    }
+    long ceilBlockFP = getCeilBlockFP(scratchArc, node.output);
+    openBlocks(node, ceilBlockFP, ceilBlockFP);
+  }
+
+  private long getFloorBlockFP(FST.Arc<Long> arc, Long output) throws IOException {
+    while (true) {
+      output = outputs.add(output, arc.output());
+      if (arc.label() == FST.END_LABEL) {
+        return output;
+      }
+      fst.readFirstTargetArc(arc, arc, fstReader);
+    }
+  }
+
+  private long getCeilBlockFP(FST.Arc<Long> arc, Long output) throws IOException {
+    while (true) {
+      output = outputs.add(output, arc.output());
+      if (arc.label() == FST.END_LABEL) {
+        return output;
+      }
+      fst.readLastTargetArc(arc, arc, fstReader);
+    }
+  }
+
+  private Node stackNode() {
+    assert branchDepth < branchNodes.length;
+    if (++branchDepth == branchNodes.length) {
+      branchNodes = ArrayUtil.growExact(branchNodes, ArrayUtil.oversize(branchDepth + 1, RamUsageEstimator.NUM_BYTES_OBJECT_REF));
+    }
+    Node node = branchNodes[branchDepth];
+    if (node == null) {
+      node = branchNodes[branchDepth] = new Node(branchDepth);
+    }
+    return node;
+  }
+
+  private Node popNode() {
+    assert branchDepth >= 0;
+    return --branchDepth == -1 ? null : getCurrentNode();
+  }
+
+  private Node getCurrentNode() {
+    return branchNodes[branchDepth];
+  }
+
+  private void openAllSubBlocks(Node node) throws IOException {
+    assert node.arc.label() != FST.END_LABEL;
+    fst.readFirstTargetArc(node.followArc, scratchArc, fstReader);
+    if (scratchArc.label() == FST.END_LABEL) {
+      fst.readNextArc(scratchArc, fstReader);
+    }
+    long startBlockFP = getFloorBlockFP(scratchArc, node.output);
+    fst.readLastTargetArc(node.followArc, scratchArc, fstReader);
+    long endBlockFP = getCeilBlockFP(scratchArc, node.output);
+    openBlocks(node, maybePreviousBlockFP(node, startBlockFP), endBlockFP);
+  }
+
+  private void openPreviousBlock(Node node, long blockFP) throws IOException {
+    assert !scanPreviousBlock;
+    long previousBlockFP = maybePreviousBlockFP(node, blockFP);
+    if (previousBlockFP != blockFP) {
+      assert scanPreviousBlock;
+      openBlocks(node, previousBlockFP, previousBlockFP);
+    }
+  }
+
+  private long maybePreviousBlockFP(Node node, long startBlockFP) throws IOException {
+    assert !scanPreviousBlock;
+    //if (debug) System.out.println("previous block check floorMatch=" + node.requiresFloorMatch + " startFP=" + startBlockFP + " inputFP=" + blockInput.getFilePointer() + " skippedOutput=" + lastSkippedArcOutput);
+    if (node.requiresFloorMatch && startBlockFP != blockInput.getFilePointer() && lastSkippedArcOutput != null) {
+      long lastSkippedBlockFP = getCeilBlockFP(lastSkippedArc, lastSkippedArcOutput);
+      lastSkippedArcOutput = null;
+      //if (debug) System.out.println("needs previous block previousFP=" + lastSkippedBlockFP + " startFP=" + startBlockFP);
+      assert lastSkippedBlockFP < startBlockFP;
+      startBlockFP = lastSkippedBlockFP;
+      scanPreviousBlock = true;
+    }
+    return startBlockFP;
+  }
+
+  private void openBlocks(Node node, long startBlockFP, long endBlockFP) throws IOException {
+    assert startBlockFP <= endBlockFP;
+    assert blockFPAlwaysIncreases(startBlockFP);
+    //if (debug) System.out.println("open blocks startFP=" + startBlockFP + " endFP=" + endBlockFP + " inputFP=" + blockInput.getFilePointer());
+    initializeHeader(null, startBlockFP);
+    if (blockHeader == null) {
+      throw newCorruptIndexException("Illegal absence of block", startBlockFP);
+    }
+    shouldScanBlock = true;
+    this.endBlockFP = endBlockFP;
+    assert matchIndex == 0;
+    setCommonPrefix(node);
+  }
+
+  private boolean blockFPAlwaysIncreases(long startBlockFP) {
+    if (!firstBlockOpened) {
+      firstBlockOpened = true;
+      return true;
+    }
+    assert startBlockFP >= blockInput.getFilePointer() : "startBlockFP=" + startBlockFP + " inputFP=" + blockInput.getFilePointer();
     return true;
   }
 
-  /**
-   * Find the next block line that matches, or null when at end of block.
-   */
-  protected BytesRef nextTermInBlockMatching() throws IOException {
-    do {
-      // if seekTerm is set, then we seek into this block instead of starting with the first blindly.
-      if (seekTerm != null) {
-        assert blockLine == null;
-        boolean moveBeyondIfFound = seekTerm == startTerm; // for startTerm, we want to get the following term
-        SeekStatus seekStatus = seekInBlock(seekTerm);
-        seekTerm = null;// reset.
-        if (seekStatus == SeekStatus.END) {
-          return null;
-        } else if (seekStatus == SeekStatus.FOUND && moveBeyondIfFound) {
-          if (readLineInBlock() == null) {
-            return null;
-          }
-        }
-        assert blockLine != null;
-      } else {
-        if (readLineInBlock() == null) {
-          return null;
-        }
-      }
-
-      TermBytes lineTermBytes = blockLine.getTermBytes();
-      BytesRef lineTerm = lineTermBytes.getTerm();
-
-      if (commonSuffixRef == null || StringHelper.endsWith(lineTerm, commonSuffixRef)) {
-        if (runAutomatonFromPrefix(lineTerm)) {
-          return lineTerm;
-        } else if (beyondCommonPrefix) {
-          return null;
-        }
-      }
-
-    } while (true);
-  }
-
-  protected boolean runAutomatonFromPrefix(BytesRef term) {
-    int state = runAutomatonForState(term.bytes, term.offset + blockPrefixLen, term.length - blockPrefixLen, blockPrefixRunAutomatonState);
-    if (state >= 0 && runAutomaton.isAccept(state)) {
-      return true;
+  private void setCommonPrefix(Node node) {
+    if (scanPreviousBlock) {
+      commonPrefixIndex = 0;
+    } else {
+      commonPrefixIndex = node.commonPrefixIndex;
+      matchStates[commonPrefixIndex] = node.commonPrefixState;
     }
-    if (isBeyondCommonPrefix(term)) {
-      // If the automaton rejects early the term, before the common prefix length,
-      // and if the term rejected byte is lexicographically after the same byte in the common prefix,
-      // then it means the current term is beyond the common prefix.
-      // Exit immediately the enumeration.
-      beyondCommonPrefix = true;
-    }
-    return false;
-  }
-
-  /**
-   * Run the automaton and return the final state (not necessary accepted). -1 signifies no state / no match.
-   * Sets {@link #numBytesAccepted} with the offset of the first byte rejected by the automaton;
-   * or (offset + length) if no byte is rejected.
-   */
-  protected int runAutomatonForState(byte[] s, int offset, int length, int initialState) {
-    //see ByteRunAutomaton.run(); similar
-    int state = initialState;
-    int index = 0;
-    while (index < length) {
-      state = runAutomaton.step(state, s[index + offset] & 0xFF);
-      if (state == -1) {
-        break;
-      }
-      index++;
-    }
-    numBytesAccepted = index;
-    return state;
-  }
-
-  /**
-   * Determines if the provided {@link BytesRef} is beyond the automaton common prefix.
-   * This method must be called after a call to {@link #runAutomatonForState} because
-   * it uses {@link #numBytesAccepted} value.
-   */
-  protected boolean isBeyondCommonPrefix(BytesRef bytesRef) {
-    // If the automaton rejects early the bytes, before the common prefix length,
-    // and if the rejected byte is lexicographically after the same byte in the common prefix,
-    // then it means the bytes are beyond the common prefix.
-    return numBytesAccepted < commonPrefixRef.length
-        && numBytesAccepted < bytesRef.length
-        && (bytesRef.bytes[numBytesAccepted + bytesRef.offset] & 0xFF) > (commonPrefixRef.bytes[numBytesAccepted + commonPrefixRef.offset] & 0xFF);
   }
 
   @Override
@@ -294,265 +630,234 @@ public class IntersectBlockReader extends BlockReader {
     throw new UnsupportedOperationException();
   }
 
-  /**
-   * This is a copy of AutomatonTermsEnum.  Since it's an inner class, the outer class can
-   * call methods that ATE does not expose.  It'd be nice if ATE's logic could be more extensible.
-   */
-  protected static class AutomatonNextTermCalculator {
-    // a tableized array-based form of the DFA
-    protected final ByteRunAutomaton runAutomaton;
-    // common suffix of the automaton
-    protected final BytesRef commonSuffixRef;
-    // true if the automaton accepts a finite language
-    protected final boolean finite;
-    // array of sorted transitions for each state, indexed by state number
-    protected final Automaton automaton;
-    // for path tracking: each long records gen when we last
-    // visited the state; we use gens to avoid having to clear
-    protected final long[] visited;
-    protected long curGen;
-    // the reference used for seeking forwards through the term dictionary
-    protected final BytesRefBuilder seekBytesRef = new BytesRefBuilder();
-    // true if we are enumerating an infinite portion of the DFA.
-    // in this case it is faster to drive the query based on the terms dictionary.
-    // when this is true, linearUpperBound indicate the end of range
-    // of terms where we should simply do sequential reads instead.
-    protected boolean linear = false;
-    protected final BytesRef linearUpperBound = new BytesRef(10);
-    protected Transition transition = new Transition();
-    protected final IntsRefBuilder savedStates = new IntsRefBuilder();
+  private enum ArcIteration {FIRST, TAIL, OVER}
 
-    protected AutomatonNextTermCalculator(CompiledAutomaton compiled) {
-      if (compiled.type != CompiledAutomaton.AUTOMATON_TYPE.NORMAL) {
-        throw new IllegalArgumentException("please use CompiledAutomaton.getTermsEnum instead");
-      }
-      this.finite = compiled.finite;
-      this.runAutomaton = compiled.runAutomaton;
-      assert this.runAutomaton != null;
-      this.commonSuffixRef = compiled.commonSuffixRef;
-      this.automaton = compiled.automaton;
+  private class Node {
 
-      // used for path tracking, where each bit is a numbered state.
-      visited = new long[runAutomaton.getSize()];
+    final int depth;
+
+    final FST.Arc<Long> followArc;
+    final FST.Arc<Long> arc;
+    final FST.Arc<Long> nextArc;
+    ArcIteration arcIteration;
+    boolean onlyFloorOrCeil;
+    boolean requiresFloorMatch;
+    boolean requiresCeilMatch;
+    int commonPrefixIndex;
+    int commonPrefixState;
+    Long output;
+
+    final Transition transition;
+    int transitionCount;
+    int transitionIndex;
+
+    Node(int depth) {
+      assert depth >= 0;
+      this.depth = depth;
+      followArc = new FST.Arc<>();
+      arc = new FST.Arc<>();
+      nextArc = new FST.Arc<>();
+      transition = new Transition();
     }
 
-    /** True if the current state of the automata is best iterated linearly (without seeking). */
-    protected boolean isLinearState(BytesRef term) {
-      return linear && term.compareTo(linearUpperBound) < 0;
+    Node asRoot() throws IOException {
+      reset(fst.getFirstArc(new FST.Arc<>()), outputs.getNoOutput(), AUTOMATON_INITIAL_STATE, false, false);
+      return this;
     }
 
-    /** @see org.apache.lucene.index.FilteredTermsEnum#nextSeekTerm(BytesRef) */
-    protected BytesRef nextSeekTerm(final BytesRef term) throws IOException {
-      //System.out.println("ATE.nextSeekTerm term=" + term);
-      if (term == null) {
-        assert seekBytesRef.length() == 0;
-        // return the empty term, as it's valid
-        if (runAutomaton.isAccept(0)) {
-          return seekBytesRef.get();
+    Node follow(Node node, MatchResult matchResult) throws IOException {
+      assert !node.onlyFloorOrCeil;
+      reset(node.arc, node.output, matchResult.exactMatchState, matchResult.floorMatch, matchResult.ceilMatch);
+      setCommonPrefix(node);
+      //if (debug) System.out.println("[" + depth + "] stack node" + (onlyFloorOrCeil ? " onlyFloorOrCeil" : "") + " common prefix index=" + commonPrefixIndex + " state=" + commonPrefixState + " output=" + output);
+      return this;
+    }
+
+    /**
+     * Resets this reusable {@link Node}.
+     *
+     * @param followArc       The {@link FST.Arc} to follow to move to the next FST node, and initialize the iteration
+     *                        on its first {@link FST.Arc}, and initialize on the first transition of the automaton state.
+     * @param exactMatchState The automaton state to get the {@link Transition}s from; or -1 if none, in this case only
+     *                        the ceil block of the sub-branch will be scanned, all other arcs and blocks will be skipped.
+     */
+    private void reset(FST.Arc<Long> followArc, Long parentOutput, int exactMatchState, boolean floorMatch, boolean ceilMatch) throws IOException {
+      assert exactMatchState != -1 || floorMatch || ceilMatch;
+      transitionIndex = 0;
+      if (exactMatchState == -1) {
+        // Fake node to handle floor and/or ceil match.
+        onlyFloorOrCeil = true;
+        if (!ceilMatch) {
+          // Set the last arc to record it is skipped when this node is poped from the stack.
+          fst.readLastTargetArc(followArc, arc, fstReader);
         }
+        transitionCount = 1; // Fake transition count to ensure this node is not considered exhausted.
       } else {
-        seekBytesRef.copyBytes(term);
+        onlyFloorOrCeil = false;
+        // Read the first arc. It may be a fake final arc for the node.
+        fst.readFirstTargetArc(followArc, arc, fstReader);
+        if (!arc.isLast()) {
+          nextArc.copyFrom(arc);
+          fst.readNextArc(nextArc, fstReader);
+        }
+        transitionCount = automaton.initTransition(exactMatchState, transition);
+        if (transitionCount == 0) {
+          // Special state to try with 0 transition because it can accept the final arc FST.END_LABEL or floor match.
+          transitionIndex = -1;
+        } else {
+          automaton.getNextTransition(transition);
+        }
       }
+      this.followArc.copyFrom(followArc);
+      requiresFloorMatch = floorMatch;
+      requiresCeilMatch = ceilMatch;
+      arcIteration = ArcIteration.FIRST;
+      output = outputs.add(parentOutput, followArc.output());
+    }
 
-      // seek to the next possible string;
-      if (nextString()) {
-        return seekBytesRef.get();  // reposition
+    private void setCommonPrefix(Node node) {
+      if (onlyFloorOrCeil || node.isLastArc()) {
+        // Simply propagate the existing common prefix.
+        commonPrefixIndex = node.commonPrefixIndex;
+        commonPrefixState = node.commonPrefixState;
       } else {
-        return null;          // no more possible strings can match
+        // Set a common prefix based on parent node.
+        commonPrefixIndex = node.depth;
+        commonPrefixState = node.transition.source;
+      }
+      assert depth >= commonPrefixIndex;
+      assert commonPrefixIndex != 0 || commonPrefixState == 0;
+    }
+
+    boolean nextArc() throws IOException {
+      assert arcIteration != ArcIteration.OVER;
+      if (arc.isLast()) {
+        arcIteration = ArcIteration.OVER;
+        return false;
+      }
+      arc.copyFrom(nextArc);
+      if (!nextArc.isLast()) {
+        fst.readNextArc(nextArc, fstReader);
+      }
+      arcIteration = ArcIteration.TAIL;
+      return true;
+    }
+
+    boolean isFirstArc() {
+      return arcIteration == ArcIteration.FIRST;
+    }
+
+    boolean isLastArc() {
+      return arc.isLast();
+    }
+
+    boolean isArcIterationOver() {
+      return arcIteration == ArcIteration.OVER;
+    }
+
+    void jumpToLastArc() throws IOException {
+      if (!arc.isLast()) {
+        if (nextArc.isLast()) {
+          nextArc();
+        } else {
+          fst.readLastTargetArc(followArc, arc, fstReader);
+        }
       }
     }
 
-    /**
-     * Sets the enum to operate in linear fashion, as we have found
-     * a looping transition at position: we set an upper bound and
-     * act like a TermRangeQuery for this portion of the term space.
-     */
-    protected void setLinear(int position) {
-      assert linear == false;
+    /** Exhausts the arc iteration without jumping to the last arc. */
+    void exhaustArcIteration() {
+      arcIteration = ArcIteration.OVER;
+    }
 
-      int state = 0;
-      assert state == 0;
-      int maxInterval = 0xff;
-      //System.out.println("setLinear pos=" + position + " seekbytesRef=" + seekBytesRef);
-      for (int i = 0; i < position; i++) {
-        state = runAutomaton.step(state, seekBytesRef.byteAt(i) & 0xff);
-        assert state >= 0: "state=" + state;
-      }
-      final int numTransitions = automaton.getNumTransitions(state);
-      automaton.initTransition(state, transition);
-      for (int i = 0; i < numTransitions; i++) {
+    boolean nextTransition() {
+      assert transitionIndex >= 0 && transitionIndex < transitionCount;
+      if (++transitionIndex < transitionCount) {
         automaton.getNextTransition(transition);
-        if (transition.min <= (seekBytesRef.byteAt(position) & 0xff) &&
-            (seekBytesRef.byteAt(position) & 0xff) <= transition.max) {
-          maxInterval = transition.max;
-          break;
-        }
-      }
-      // 0xff terms don't get the optimization... not worth the trouble.
-      if (maxInterval != 0xff)
-        maxInterval++;
-      int length = position + 1; /* position + maxTransition */
-      if (linearUpperBound.bytes.length < length)
-        linearUpperBound.bytes = new byte[length];
-      System.arraycopy(seekBytesRef.bytes(), 0, linearUpperBound.bytes, 0, position);
-      linearUpperBound.bytes[position] = (byte) maxInterval;
-      linearUpperBound.length = length;
-
-      linear = true;
-    }
-
-    /**
-     * Increments the byte buffer to the next String in binary order after s that will not put
-     * the machine into a reject state. If such a string does not exist, returns
-     * false.
-     *
-     * The correctness of this method depends upon the automaton being deterministic,
-     * and having no transitions to dead states.
-     *
-     * @return true if more possible solutions exist for the DFA
-     */
-    protected boolean nextString() {
-      int state;
-      int pos = 0;
-      savedStates.grow(seekBytesRef.length()+1);
-      savedStates.setIntAt(0, 0);
-
-      while (true) {
-        curGen++;
-        linear = false;
-        // walk the automaton until a character is rejected.
-        for (state = savedStates.intAt(pos); pos < seekBytesRef.length(); pos++) {
-          visited[state] = curGen;
-          int nextState = runAutomaton.step(state, seekBytesRef.byteAt(pos) & 0xff);
-          if (nextState == -1)
-            break;
-          savedStates.setIntAt(pos+1, nextState);
-          // we found a loop, record it for faster enumeration
-          if (!finite && !linear && visited[nextState] == curGen) {
-            setLinear(pos);
-          }
-          state = nextState;
-        }
-
-        // take the useful portion, and the last non-reject state, and attempt to
-        // append characters that will match.
-        if (nextString(state, pos)) {
-          return true;
-        } else { /* no more solutions exist from this useful portion, backtrack */
-          if ((pos = backtrack(pos)) < 0) /* no more solutions at all */
-            return false;
-          final int newState = runAutomaton.step(savedStates.intAt(pos), seekBytesRef.byteAt(pos) & 0xff);
-          if (newState >= 0 && runAutomaton.isAccept(newState))
-            /* String is good to go as-is */
-            return true;
-          /* else advance further */
-          // TODO: paranoia? if we backtrack thru an infinite DFA, the loop detection is important!
-          // for now, restart from scratch for all infinite DFAs
-          if (!finite) pos = 0;
-        }
-      }
-    }
-
-    /**
-     * Returns the next String in lexicographic order that will not put
-     * the machine into a reject state.
-     *
-     * This method traverses the DFA from the given position in the String,
-     * starting at the given state.
-     *
-     * If this cannot satisfy the machine, returns false. This method will
-     * walk the minimal path, in lexicographic order, as long as possible.
-     *
-     * If this method returns false, then there might still be more solutions,
-     * it is necessary to backtrack to find out.
-     *
-     * @param state current non-reject state
-     * @param position useful portion of the string
-     * @return true if more possible solutions exist for the DFA from this
-     *         position
-     */
-    protected boolean nextString(int state, int position) {
-      /*
-       * the next lexicographic character must be greater than the existing
-       * character, if it exists.
-       */
-      int c = 0;
-      if (position < seekBytesRef.length()) {
-        c = seekBytesRef.byteAt(position) & 0xff;
-        // if the next byte is 0xff and is not part of the useful portion,
-        // then by definition it puts us in a reject state, and therefore this
-        // path is dead. there cannot be any higher transitions. backtrack.
-        if (c++ == 0xff)
-          return false;
-      }
-
-      seekBytesRef.setLength(position);
-      visited[state] = curGen;
-
-      final int numTransitions = automaton.getNumTransitions(state);
-      automaton.initTransition(state, transition);
-      // find the minimal path (lexicographic order) that is >= c
-
-      for (int i = 0; i < numTransitions; i++) {
-        automaton.getNextTransition(transition);
-        if (transition.max >= c) {
-          int nextChar = Math.max(c, transition.min);
-          // append either the next sequential char, or the minimum transition
-          seekBytesRef.grow(seekBytesRef.length() + 1);
-          seekBytesRef.append((byte) nextChar);
-          state = transition.dest;
-          /*
-           * as long as is possible, continue down the minimal path in
-           * lexicographic order. if a loop or accept state is encountered, stop.
-           */
-          while (visited[state] != curGen && !runAutomaton.isAccept(state)) {
-            visited[state] = curGen;
-            /*
-             * Note: we work with a DFA with no transitions to dead states.
-             * so the below is ok, if it is not an accept state,
-             * then there MUST be at least one transition.
-             */
-            automaton.initTransition(state, transition);
-            automaton.getNextTransition(transition);
-            state = transition.dest;
-
-            // append the minimum transition
-            seekBytesRef.grow(seekBytesRef.length() + 1);
-            seekBytesRef.append((byte) transition.min);
-
-            // we found a loop, record it for faster enumeration
-            if (!finite && !linear && visited[state] == curGen) {
-              setLinear(seekBytesRef.length()-1);
-            }
-          }
-          return true;
-        }
+        return true;
       }
       return false;
     }
 
-    /**
-     * Attempts to backtrack thru the string after encountering a dead end
-     * at some given position. Returns false if no more possible strings
-     * can match.
-     *
-     * @param position current position in the input String
-     * @return {@code position >= 0} if more possible solutions exist for the DFA
-     */
-    protected int backtrack(int position) {
-      while (position-- > 0) {
-        int nextChar = seekBytesRef.byteAt(position) & 0xff;
-        // if a character is 0xff it's a dead-end too,
-        // because there is no higher character in binary sort order.
-        if (nextChar++ != 0xff) {
-          seekBytesRef.setByteAt(position, (byte) nextChar);
-          seekBytesRef.setLength(position+1);
-          return position;
+    boolean isTransitionIterationOver() {
+      assert transitionIndex <= transitionCount;
+      return transitionIndex == transitionCount;
+    }
+
+    boolean drainNoTransitionState() {
+      if (transitionCount == 0) {
+        transitionIndex = 0;
+        return true;
+      }
+      return false;
+    }
+
+    void setNextArc(boolean isFirstArc) throws IOException {
+      assert !onlyFloorOrCeil;
+      if (!arc.isLast()) {
+        nextArc.copyFrom(arc);
+        fst.readNextArc(nextArc, fstReader);
+      }
+      arcIteration = isFirstArc ? ArcIteration.FIRST : ArcIteration.TAIL;
+    }
+
+    int setTransitionForLabel(int label) {
+      assert !onlyFloorOrCeil;
+      if (transitionCount == 0) {
+        return -1;
+      }
+      int destState = runAutomaton.step(transition.source, label);
+      if (destState == -1) {
+        transitionIndex = transitionCount;
+      } else {
+        if (transitionIndex != 0) {
+          int transitionCount = automaton.initTransition(transition.source, transition);
+          assert transitionCount != 0 && transitionCount == this.transitionCount;
+          automaton.getNextTransition(transition);
+          transitionIndex = 0;
+        }
+        while (transition.dest != destState) {
+          nextTransition();
         }
       }
-      return -1; /* all solutions exhausted */
+      return destState;
+    }
+
+    @SuppressWarnings("unused")
+    String toString(FST.Arc<Long> arc) {
+      return (UTF8_TO_STRING ? Character.toString((char) followArc.label()) : Integer.toString(followArc.label()))
+          + "->"
+          + (arc.label() == -1 ? "[]" : (UTF8_TO_STRING ? Character.toString((char) arc.label()) : Integer.toString(arc.label())));
     }
   }
 
-}
+  private static class MatchResult {
 
+    int exactMatchState;
+    boolean floorMatch;
+    boolean ceilMatch;
+    boolean wildcardSuffix;
+
+    boolean reset(int exactMatchState, boolean floorMatch, boolean ceilMatch) {
+      this.exactMatchState = exactMatchState;
+      this.floorMatch = floorMatch;
+      this.ceilMatch = ceilMatch;
+      assert !wildcardSuffix;
+      return exactMatchState != -1 || floorMatch || ceilMatch;
+    }
+
+    boolean resetForWildcard(boolean floorMatch) {
+      this.floorMatch = floorMatch;
+      return wildcardSuffix = true;
+    }
+
+    @Override
+    public String toString() {
+      if (exactMatchState != -1 || floorMatch || ceilMatch) {
+        return (exactMatchState == -1 ? "" : "exact ") + (floorMatch ? "floor " : "") + (ceilMatch ? "ceil " : "") + "match";
+      } else {
+        return "no match";
+      }
+    }
+  }
+}

@@ -77,7 +77,7 @@ public class BlockReader extends BaseTermsEnum implements Accountable {
   /**
    * {@link IndexDictionary.Browser} supplier for lazy loading.
    */
-  protected final IndexDictionary.BrowserSupplier dictionaryBrowserSupplier;
+  protected final IndexDictionary.Supplier dictionarySupplier;
   /**
    * Holds the {@link IndexDictionary.Browser} once loaded.
    */
@@ -131,15 +131,15 @@ public class BlockReader extends BaseTermsEnum implements Accountable {
   protected final BlockTermState scratchTermState;
 
   /**
-   * @param dictionaryBrowserSupplier to load the {@link IndexDictionary.Browser}
+   * @param dictionarySupplier to load the {@link IndexDictionary.Browser}
    *                                  lazily in {@link #seekCeil(BytesRef)}.
    * @param blockDecoder              Optional block decoder, may be null if none.
    *                                  It can be used for decompression or decryption.
    */
-  protected BlockReader(IndexDictionary.BrowserSupplier dictionaryBrowserSupplier, IndexInput blockInput,
+  protected BlockReader(IndexDictionary.Supplier dictionarySupplier, IndexInput blockInput,
                         PostingsReaderBase postingsReader, FieldMetadata fieldMetadata,
                         BlockDecoder blockDecoder) throws IOException {
-    this.dictionaryBrowserSupplier = dictionaryBrowserSupplier;
+    this.dictionarySupplier = dictionarySupplier;
     this.blockInput = blockInput;
     this.postingsReader = postingsReader;
     this.fieldMetadata = fieldMetadata;
@@ -546,7 +546,7 @@ public class BlockReader extends BaseTermsEnum implements Accountable {
 
   protected IndexDictionary.Browser getOrCreateDictionaryBrowser() throws IOException {
     if (dictionaryBrowser == null) {
-      dictionaryBrowser = dictionaryBrowserSupplier.get();
+      dictionaryBrowser = dictionarySupplier.get().browser();
     }
     return dictionaryBrowser;
   }
@@ -559,7 +559,7 @@ public class BlockReader extends BaseTermsEnum implements Accountable {
     termStateForced = false;
   }
 
-  private CorruptIndexException newCorruptIndexException(String msg, Long fp) {
+  protected CorruptIndexException newCorruptIndexException(String msg, Long fp) {
     return new CorruptIndexException(msg
         + (fp == null ? "" : " at FP " + fp)
         + " for field \"" + fieldMetadata.getFieldInfo().name + "\"", blockInput);

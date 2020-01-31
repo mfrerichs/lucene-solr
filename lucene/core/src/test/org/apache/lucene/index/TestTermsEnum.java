@@ -126,7 +126,7 @@ public class TestTermsEnum extends LuceneTestCase {
           if (VERBOSE) {
             System.out.println("  got " + status);
           }
-          
+
           if (upto < 0) {
             upto = -(upto+1);
             if (upto >= terms.size()) {
@@ -273,7 +273,7 @@ public class TestTermsEnum extends LuceneTestCase {
         }
         a = Automata.makeStringUnion(sortedAcceptTerms);
       }
-      
+
       final CompiledAutomaton c = new CompiledAutomaton(a, true, false, 1000000, false);
 
       final BytesRef[] acceptTermsArray = new BytesRef[acceptTerms.size()];

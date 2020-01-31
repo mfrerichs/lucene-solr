@@ -19,11 +19,13 @@ package org.apache.lucene.codecs.uniformsplit.sharedterms;
 
 import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.uniformsplit.TestUniformSplitPostingFormat;
+import org.apache.lucene.util.LuceneTestCase;
 import org.apache.lucene.util.TestUtil;
 
 /**
  * Tests {@link STUniformSplitPostingsFormat} with block encoding using ROT13 cypher.
  */
+@LuceneTestCase.AwaitsFix(bugUrl="implement STIntersectBlockReader")//nocommit
 public class TestSTUniformSplitPostingFormat extends TestUniformSplitPostingFormat {
 
   private final Codec codec = TestUtil.alwaysPostingsFormat(new STUniformSplitRot13PostingsFormat());

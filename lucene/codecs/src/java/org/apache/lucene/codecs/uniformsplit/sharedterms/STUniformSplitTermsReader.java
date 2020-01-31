@@ -65,10 +65,10 @@ public class STUniformSplitTermsReader extends UniformSplitTermsReader {
     if (!fieldMetadataCollection.isEmpty()) {
       FieldMetadata unionFieldMetadata = createUnionFieldMetadata(fieldMetadataCollection);
       // Share the same immutable dictionary between all fields.
-      IndexDictionary.BrowserSupplier dictionaryBrowserSupplier = new FSTDictionary.BrowserSupplier(dictionaryInput, fieldMetadataCollection.iterator().next().getDictionaryStartFP(), blockDecoder);
+      IndexDictionary.Supplier dictionarySupplier = new FSTDictionary.Supplier(dictionaryInput, fieldMetadataCollection.iterator().next().getDictionaryStartFP(), blockDecoder);
       for (FieldMetadata fieldMetadata : fieldMetadataCollection) {
         fieldToTermsMap.put(fieldMetadata.getFieldInfo().name,
-            new STUniformSplitTerms(blockInput, fieldMetadata, unionFieldMetadata, postingsReader, blockDecoder, fieldInfos, dictionaryBrowserSupplier));
+            new STUniformSplitTerms(blockInput, fieldMetadata, unionFieldMetadata, postingsReader, blockDecoder, fieldInfos, dictionarySupplier));
       }
     }
   }

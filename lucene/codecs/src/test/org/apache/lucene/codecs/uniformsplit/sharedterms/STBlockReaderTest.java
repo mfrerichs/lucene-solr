@@ -57,7 +57,7 @@ public class STBlockReaderTest extends LuceneTestCase {
 
   private FieldInfos fieldInfos;
   private List<MockSTBlockLine> blockLines;
-  private IndexDictionary.BrowserSupplier supplier;
+  private IndexDictionary.Supplier supplier;
   private ByteBuffersDirectory directory;
 
   @Override
@@ -82,10 +82,10 @@ public class STBlockReaderTest extends LuceneTestCase {
     IndexDictionary.Builder builder = new FSTDictionary.Builder();
     builder.add(new BytesRef("a"), 0);
     IndexDictionary indexDictionary = builder.build();
-    supplier = new IndexDictionary.BrowserSupplier() {
+    supplier = new IndexDictionary.Supplier() {
       @Override
-      public IndexDictionary.Browser get() throws IOException {
-        return indexDictionary.browser();
+      public IndexDictionary get() {
+        return indexDictionary;
       }
       @Override
       public long ramBytesUsed() {
@@ -250,7 +250,7 @@ public class STBlockReaderTest extends LuceneTestCase {
 
     List<MockSTBlockLine> lines;
 
-    MockSTBlockReader(IndexDictionary.BrowserSupplier supplier, List<MockSTBlockLine> lines, Directory directory, FieldInfo fieldInfo, FieldInfos fieldInfos) throws IOException {
+    MockSTBlockReader(IndexDictionary.Supplier supplier, List<MockSTBlockLine> lines, Directory directory, FieldInfo fieldInfo, FieldInfos fieldInfos) throws IOException {
       super(supplier, directory.openInput(MOCK_BLOCK_OUTPUT_NAME, IOContext.DEFAULT),
           getMockPostingReaderBase(), mockFieldMetadata(fieldInfo, getLastTermForField(lines, fieldInfo.name)), null, fieldInfos);
       this.lines = lines;

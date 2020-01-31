@@ -43,13 +43,13 @@ import org.apache.lucene.util.BytesRef;
 public class STMergingBlockReader extends STBlockReader {
 
   public STMergingBlockReader(
-      IndexDictionary.BrowserSupplier dictionaryBrowserSupplier,
+      IndexDictionary.Supplier dictionarySupplier,
       IndexInput blockInput,
       PostingsReaderBase postingsReader,
       FieldMetadata fieldMetadata,
       BlockDecoder blockDecoder,
       FieldInfos fieldInfos) throws IOException {
-    super(dictionaryBrowserSupplier, blockInput, postingsReader, fieldMetadata, blockDecoder, fieldInfos);
+    super(dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder, fieldInfos);
   }
 
   @Override

@@ -986,7 +986,7 @@ public final class FST<T> implements Accountable {
    * 
    * @return Returns the second argument
    * (<code>arc</code>). */
-  Arc<T> readLastTargetArc(Arc<T> follow, Arc<T> arc, BytesReader in) throws IOException {
+  public Arc<T> readLastTargetArc(Arc<T> follow, Arc<T> arc, BytesReader in) throws IOException {
     //System.out.println("readLast");
     if (!targetHasArcs(follow)) {
       //System.out.println("  end node");
@@ -994,7 +994,7 @@ public final class FST<T> implements Accountable {
       arc.label = END_LABEL;
       arc.target = FINAL_END_NODE;
       arc.output = follow.nextFinalOutput();
-      arc.flags = BIT_LAST_ARC;
+      arc.flags = BIT_FINAL_ARC | BIT_LAST_ARC;
       arc.nodeFlags = arc.flags;
       return arc;
     } else {
@@ -1134,7 +1134,7 @@ public final class FST<T> implements Accountable {
 
   /** Peeks at next arc's label; does not alter arc.  Do
    *  not call this if arc.isLast()! */
-  int readNextArcLabel(Arc<T> arc, BytesReader in) throws IOException {
+  public int readNextArcLabel(Arc<T> arc, BytesReader in) throws IOException {
     assert !arc.isLast();
 
     if (arc.label() == END_LABEL) {

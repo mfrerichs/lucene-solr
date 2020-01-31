@@ -22,6 +22,7 @@ import java.io.IOException;
 import org.apache.lucene.codecs.BlockTermState;
 import org.apache.lucene.codecs.PostingsReaderBase;
 import org.apache.lucene.codecs.uniformsplit.BlockDecoder;
+import org.apache.lucene.codecs.uniformsplit.FSTDictionary;
 import org.apache.lucene.codecs.uniformsplit.FieldMetadata;
 import org.apache.lucene.codecs.uniformsplit.IndexDictionary;
 import org.apache.lucene.codecs.uniformsplit.IntersectBlockReader;
@@ -42,9 +43,9 @@ public class STIntersectBlockReader extends IntersectBlockReader {
   protected final FieldInfos fieldInfos;
 
   public STIntersectBlockReader(CompiledAutomaton compiled, BytesRef startTerm,
-                                IndexDictionary.BrowserSupplier dictionaryBrowserSupplier, IndexInput blockInput, PostingsReaderBase postingsReader,
+                                FSTDictionary.Supplier dictionarySupplier, IndexInput blockInput, PostingsReaderBase postingsReader,
                                 FieldMetadata fieldMetadata, BlockDecoder blockDecoder, FieldInfos fieldInfos) throws IOException {
-    super(compiled, startTerm, dictionaryBrowserSupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
+    super(compiled, startTerm, dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
     this.fieldInfos = fieldInfos;
   }
 
@@ -85,10 +86,12 @@ public class STIntersectBlockReader extends IntersectBlockReader {
     return termState != null;
   }
 
-  @Override
+  //TODO: rework this class
+  //@Override
   protected boolean nextBlockMatchingPrefix() throws IOException {
     // block header maybe null if we are positioned outside the field block range
-    return super.nextBlockMatchingPrefix() && blockHeader != null;
+    //return super.nextBlockMatchingPrefix() && blockHeader != null;
+    return false;
   }
 
   @Override

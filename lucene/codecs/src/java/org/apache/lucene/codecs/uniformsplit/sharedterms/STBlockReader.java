@@ -39,10 +39,10 @@ public class STBlockReader extends BlockReader {
 
   protected final FieldInfos fieldInfos;
 
-  public STBlockReader(IndexDictionary.BrowserSupplier dictionaryBrowserSupplier,
+  public STBlockReader(IndexDictionary.Supplier dictionarySupplier,
                        IndexInput blockInput, PostingsReaderBase postingsReader,
                        FieldMetadata fieldMetadata, BlockDecoder blockDecoder, FieldInfos fieldInfos) throws IOException {
-    super(dictionaryBrowserSupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
+    super(dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
     this.fieldInfos = fieldInfos;
   }
 

@@ -95,7 +95,7 @@ public abstract class TopTermsRewrite<B> extends TermCollectingRewrite<B> {
         } else if (t == null) {
           lastTerm = null;
         } else {
-          assert lastTerm.get().compareTo(t) < 0: "lastTerm=" + lastTerm + " t=" + t;
+          assert lastTerm.get().compareTo(t) < 0: "lastTerm=" + lastTerm.get() + " t=" + t;
           lastTerm.copyBytes(t);
         }
         return true;

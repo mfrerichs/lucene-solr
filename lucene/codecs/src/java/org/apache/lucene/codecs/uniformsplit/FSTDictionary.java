@@ -25,10 +25,8 @@ import org.apache.lucene.store.DataInput;
 import org.apache.lucene.store.DataOutput;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.BytesRefBuilder;
 import org.apache.lucene.util.IntsRefBuilder;
 import org.apache.lucene.util.RamUsageEstimator;
-import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.fst.BytesRefFSTEnum;
 import org.apache.lucene.util.fst.FST;
 import org.apache.lucene.util.fst.FSTCompiler;
@@ -58,24 +56,24 @@ public class FSTDictionary implements IndexDictionary {
 
   private static final long BASE_RAM_USAGE = RamUsageEstimator.shallowSizeOfInstance(FSTDictionary.class);
 
-  protected final FST<Long> dictionary;
+  protected final FST<Long> fst;
 
-  protected FSTDictionary(FST<Long> dictionary) {
-    this.dictionary = dictionary;
+  protected FSTDictionary(FST<Long> fst) {
+    this.fst = fst;
   }
 
   @Override
   public long ramBytesUsed() {
-    return BASE_RAM_USAGE + dictionary.ramBytesUsed();
+    return BASE_RAM_USAGE + fst.ramBytesUsed();
   }
 
   @Override
   public void write(DataOutput output, BlockEncoder blockEncoder) throws IOException {
     if (blockEncoder == null) {
-      dictionary.save(output);
+      fst.save(output);
     } else {
       ByteBuffersDataOutput bytesDataOutput = ByteBuffersDataOutput.newResettableInstance();
-      dictionary.save(bytesDataOutput);
+      fst.save(bytesDataOutput);
       BlockEncoder.WritableBytes encodedBytes = blockEncoder.encode(bytesDataOutput.toDataInput(), bytesDataOutput.size());
       output.writeVLong(encodedBytes.size());
       encodedBytes.writeTo(output);
@@ -111,92 +109,21 @@ public class FSTDictionary implements IndexDictionary {
    */
   protected class Browser implements IndexDictionary.Browser {
 
-    protected final BytesRefFSTEnum<Long> fstEnum = new BytesRefFSTEnum<>(dictionary);
-
-    protected static final int STATE_SEEK = 0, STATE_NEXT = 1, STATE_END = 2;
-    protected int state = STATE_SEEK;
-
-    //  Note: key and pointer are one position prior to the current fstEnum position,
-    //   since we need need the fstEnum to be one ahead to calculate the prefix.
-    protected final BytesRefBuilder keyBuilder = new BytesRefBuilder();
-    protected int blockPrefixLen = 0;
-    protected long blockFilePointer = -1;
+    protected final BytesRefFSTEnum<Long> fstEnum = new BytesRefFSTEnum<>(fst);
 
     @Override
     public long seekBlock(BytesRef term) throws IOException {
-      state = STATE_SEEK;
-      BytesRefFSTEnum.InputOutput<Long> seekFloor = fstEnum.seekFloor(term);
-      if (seekFloor == null) {
-        blockFilePointer = -1;
-      } else {
-        blockFilePointer = seekFloor.output;
-      }
-      return blockFilePointer;
-    }
-
-    @Override
-    public BytesRef nextKey() throws IOException {
-      if (state == STATE_END) {
-        // if fstEnum is at end, then that's it.
-        return null;
-      }
-
-      if (state == STATE_SEEK && blockFilePointer == -1) { // see seekBlock
-        if (fstEnum.next() == null) { // advance.
-          state = STATE_END; // probably never happens (empty FST)?  We code defensively.
-          return null;
-        }
-      }
-      keyBuilder.copyBytes(fstEnum.current().input);
-      blockFilePointer = fstEnum.current().output;
-      assert blockFilePointer >= 0;
-
-      state = STATE_NEXT;
-
-      BytesRef key = keyBuilder.get();
-
-      // advance fstEnum
-      BytesRefFSTEnum.InputOutput<Long> inputOutput = fstEnum.next();
-
-      // calc common prefix
-      if (inputOutput == null) {
-        state = STATE_END; // for *next* call; current state is good
-        blockPrefixLen = 0;
-      } else {
-        int sortKeyLength = StringHelper.sortKeyLength(key, inputOutput.input);
-        assert sortKeyLength >= 1;
-        blockPrefixLen = sortKeyLength - 1;
-      }
-      return key;
-    }
-
-    @Override
-    public BytesRef peekKey() {
-      assert state != STATE_SEEK;
-      return (state == STATE_END) ? null : fstEnum.current().input;
-    }
-
-    @Override
-    public int getBlockPrefixLen() {
-      assert state != STATE_SEEK;
-      assert blockPrefixLen >= 0;
-      return blockPrefixLen;
-    }
-
-    @Override
-    public long getBlockFilePointer() {
-      assert state != STATE_SEEK;
-      assert blockFilePointer >= 0;
-      return blockFilePointer;
+      BytesRefFSTEnum.InputOutput<Long> floorBlockKeyOutput = fstEnum.seekFloor(term);
+      return floorBlockKeyOutput == null ? -1 : floorBlockKeyOutput.output;
     }
   }
 
   /**
-   * Provides stateful {@link Browser} to seek in the {@link FSTDictionary}.
+   * {@link FSTDictionary} supplier.
    *
    * @lucene.experimental
    */
-  public static class BrowserSupplier implements IndexDictionary.BrowserSupplier {
+  public static class Supplier implements IndexDictionary.Supplier {
 
     protected final IndexInput dictionaryInput;
     protected final BlockDecoder blockDecoder;
@@ -204,16 +131,16 @@ public class FSTDictionary implements IndexDictionary {
     /**
      * Lazy loaded immutable index dictionary (trie hold in RAM).
      */
-    protected IndexDictionary dictionary;
+    protected FSTDictionary dictionary;
 
-    public BrowserSupplier(IndexInput dictionaryInput, long startFilePointer, BlockDecoder blockDecoder) throws IOException {
+    public Supplier(IndexInput dictionaryInput, long startFilePointer, BlockDecoder blockDecoder) throws IOException {
       this.dictionaryInput = dictionaryInput.clone();
       this.dictionaryInput.seek(startFilePointer);
       this.blockDecoder = blockDecoder;
     }
 
     @Override
-    public IndexDictionary.Browser get() throws IOException {
+    public FSTDictionary get() throws IOException {
       // This double-check idiom does not require the dictionary to be volatile
       // because it is immutable. See section "Double-Checked Locking Immutable Objects"
       // of https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html.
@@ -224,7 +151,7 @@ public class FSTDictionary implements IndexDictionary {
           }
         }
       }
-      return dictionary.browser();
+      return dictionary;
     }
 
     @Override

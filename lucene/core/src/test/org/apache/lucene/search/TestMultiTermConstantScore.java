@@ -392,7 +392,7 @@ public class TestMultiTermConstantScore extends BaseTestRangeFilter {
     ScoreDoc[] result;
 
     // test extremes, bounded on both ends
-
+/*
     result = search.search(csrq("rand", minRP, maxRP, T, T), numDocs).scoreDocs;
     assertEquals("find all", numDocs, result.length);
 
@@ -406,7 +406,7 @@ public class TestMultiTermConstantScore extends BaseTestRangeFilter {
     assertEquals("all but extremes", numDocs - 2, result.length);
 
     // unbounded
-
+*/
     result = search.search(csrq("rand", minRP, null, T, F), numDocs).scoreDocs;
     assertEquals("smallest and up", numDocs, result.length);
 

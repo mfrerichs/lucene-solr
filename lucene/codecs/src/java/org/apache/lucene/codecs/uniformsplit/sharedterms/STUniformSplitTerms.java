@@ -43,23 +43,25 @@ public class STUniformSplitTerms extends UniformSplitTerms {
 
   protected STUniformSplitTerms(IndexInput blockInput, FieldMetadata fieldMetadata,
                                 FieldMetadata unionFieldMetadata, PostingsReaderBase postingsReader,
-                                BlockDecoder blockDecoder, FieldInfos fieldInfos, IndexDictionary.BrowserSupplier dictionaryBrowserSupplier) {
-    super(blockInput, fieldMetadata, postingsReader, blockDecoder, dictionaryBrowserSupplier);
+                                BlockDecoder blockDecoder, FieldInfos fieldInfos, IndexDictionary.Supplier dictionarySupplier) {
+    super(blockInput, fieldMetadata, postingsReader, blockDecoder, dictionarySupplier);
     this.unionFieldMetadata = unionFieldMetadata;
     this.fieldInfos = fieldInfos;
   }
 
   @Override
   public TermsEnum intersect(CompiledAutomaton compiled, BytesRef startTerm) throws IOException {
-    return new STIntersectBlockReader(compiled, startTerm, dictionaryBrowserSupplier, blockInput, postingsReader, fieldMetadata, blockDecoder, fieldInfos);
+    return super.intersect(compiled, startTerm);
+    //TODO
+    //return new STIntersectBlockReader(compiled, startTerm, dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder, fieldInfos);
   }
 
   @Override
   public TermsEnum iterator() throws IOException {
-    return new STBlockReader(dictionaryBrowserSupplier, blockInput, postingsReader, fieldMetadata, blockDecoder, fieldInfos);
+    return new STBlockReader(dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder, fieldInfos);
   }
 
   STMergingBlockReader createMergingBlockReader() throws IOException {
-    return new STMergingBlockReader(dictionaryBrowserSupplier, blockInput, postingsReader, unionFieldMetadata, blockDecoder, fieldInfos);
+    return new STMergingBlockReader(dictionarySupplier, blockInput, postingsReader, unionFieldMetadata, blockDecoder, fieldInfos);
   }
 }
