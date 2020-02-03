@@ -18,6 +18,7 @@
 package org.apache.lucene.codecs.uniformsplit;
 
 import java.io.IOException;
+import java.util.Arrays;
 
 import org.apache.lucene.codecs.PostingsReaderBase;
 import org.apache.lucene.index.TermState;
@@ -26,6 +27,7 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.RamUsageEstimator;
+import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.automaton.Automaton;
 import org.apache.lucene.util.automaton.ByteRunAutomaton;
 import org.apache.lucene.util.automaton.CompiledAutomaton;
@@ -50,6 +52,7 @@ public class IntersectBlockReader extends BlockReader {
 
   private final Automaton automaton;
   private final ByteRunAutomaton runAutomaton;
+  private final BytesRef commonSuffix;
   private final FST<Long> fst;
   private final FST.BytesReader fstReader;
   private final Outputs<Long> outputs;
@@ -76,6 +79,7 @@ public class IntersectBlockReader extends BlockReader {
 
     this.automaton = compiled.automaton;
     runAutomaton = compiled.runAutomaton;
+    commonSuffix = compiled.commonSuffixRef == null ? null : (compiled.commonSuffixRef.offset == 0 ? compiled.commonSuffixRef : BytesRef.deepCopyOf(compiled.commonSuffixRef));
     fst = dictionarySupplier.get().fst;
     fstReader = fst.getBytesReader();
     outputs = fst.outputs;
@@ -308,14 +312,29 @@ public class IntersectBlockReader extends BlockReader {
       }
       TermBytes termBytes = blockLine.getTermBytes();
       BytesRef term = termBytes.term;
+      byte[] bytes = term.bytes;
       assert term.offset == 0;
+      int length = term.length;
+      if (commonSuffix != null) {
+        int suffixLength = commonSuffix.length;
+        int offset = length - suffixLength;
+        if (offset < 0) {
+          continue;
+        }
+        byte[] suffixBytes = commonSuffix.bytes;
+        for (int i = 0; i < suffixLength; i++) {
+          if (bytes[offset + i] != suffixBytes[i]) {
+            continue termLoop;
+          }
+        }
+      }
       matchIndex = Math.max(Math.min(termBytes.getSuffixOffset(), matchIndex), commonPrefixIndex);
       int state = matchStates[matchIndex];
-      while (matchIndex < term.length) {
-        state = runAutomaton.step(state, term.bytes[matchIndex] & 0xff);
+      while (matchIndex < length) {
+        state = runAutomaton.step(state, bytes[matchIndex] & 0xff);
         if (state == -1) {
           // No match.
-          assert !runAutomaton.run(term.bytes, term.offset, term.length) : term + " is rejected although the automaton accepts it";
+          assert !runAutomaton.run(bytes, 0, length);
           //if (debug) System.out.println("reject \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
           continue termLoop;
         }
@@ -326,12 +345,12 @@ public class IntersectBlockReader extends BlockReader {
       }
       if (runAutomaton.isAccept(state)) {
         // Match.
-        assert runAutomaton.run(term.bytes, term.offset, term.length) : term + " is accepted although the automaton rejects it";
+        assert runAutomaton.run(bytes, 0, length);
         //if (debug) System.out.println("accept \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
         return term;
       }
       // No match.
-      assert !runAutomaton.run(term.bytes, term.offset, term.length) : term + " is rejected although the automaton accepts it";
+      assert !runAutomaton.run(bytes, 0, length);
       //if (debug) System.out.println("reject \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
     }
   }
