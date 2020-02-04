@@ -18,7 +18,6 @@
 package org.apache.lucene.codecs.uniformsplit;
 
 import java.io.IOException;
-import java.util.Arrays;
 
 import org.apache.lucene.codecs.PostingsReaderBase;
 import org.apache.lucene.index.TermState;
@@ -31,6 +30,7 @@ import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.automaton.Automaton;
 import org.apache.lucene.util.automaton.ByteRunAutomaton;
 import org.apache.lucene.util.automaton.CompiledAutomaton;
+import org.apache.lucene.util.automaton.Operations;
 import org.apache.lucene.util.automaton.Transition;
 import org.apache.lucene.util.fst.FST;
 import org.apache.lucene.util.fst.Outputs;
@@ -43,15 +43,25 @@ import org.apache.lucene.util.fst.Outputs;
  */
 public class IntersectBlockReader extends BlockReader {
 
+  /*
+  TODO
+
+  - run all lucene tests to validate isDestAccepted fix
+  - count number of previous blocks opened
+  - count number of ceil blocks opened
+  - maybe we could compute the common prefix based on previous arc and current arc before really opening a previous block.
+   */
+
   private static final int AUTOMATON_INITIAL_STATE = 0;
   private static final BytesRef EMPTY_BYTES_REF = new BytesRef();
   private static final BytesRef ZERO_BYTES_REF = new BytesRef(new byte[] {0}, 0, 1);
 
-  //public static boolean debug = false;
+  public static boolean debug = false;//nocommit
   private static final boolean UTF8_TO_STRING = true;
 
   private final Automaton automaton;
   private final ByteRunAutomaton runAutomaton;
+  private final BytesRef commonPrefix;//nocommit
   private final BytesRef commonSuffix;
   private final FST<Long> fst;
   private final FST.BytesReader fstReader;
@@ -72,14 +82,23 @@ public class IntersectBlockReader extends BlockReader {
   private boolean returnStartTermOnce;
   private boolean firstBlockOpened;
 
+  private static long constructorCallCount;
+
   public IntersectBlockReader(CompiledAutomaton compiled, BytesRef startTerm,
                               FSTDictionary.Supplier dictionarySupplier, IndexInput blockInput, PostingsReaderBase postingsReader,
                               FieldMetadata fieldMetadata, BlockDecoder blockDecoder) throws IOException {
     super(dictionarySupplier, blockInput, postingsReader, fieldMetadata, blockDecoder);
-
+    constructorCallCount++;//nocommit
+//    System.out.println("constructorCallCount=" + constructorCallCount);
+    if (constructorCallCount == 41) {//nocommit
+//      debug = true;
+    } else {
+      debug = false;
+    }
     this.automaton = compiled.automaton;
     runAutomaton = compiled.runAutomaton;
     commonSuffix = compiled.commonSuffixRef == null ? null : (compiled.commonSuffixRef.offset == 0 ? compiled.commonSuffixRef : BytesRef.deepCopyOf(compiled.commonSuffixRef));
+    commonPrefix = Operations.getCommonPrefixBytesRef(automaton);
     fst = dictionarySupplier.get().fst;
     fstReader = fst.getBytesReader();
     outputs = fst.outputs;
@@ -90,7 +109,7 @@ public class IntersectBlockReader extends BlockReader {
     matchStates = new int[32];
     lastSkippedArc = new FST.Arc<>();
     scratchArc = new FST.Arc<>();
-    //if (debug) System.out.println("new " + IntersectBlockReader.class.getSimpleName());
+    if (debug) System.out.println("new " + IntersectBlockReader.class.getSimpleName());
     Node root = stackNode().asRoot();
     boolean startAtFirstTerm = root.transitionCount > 0 && runAutomaton.isAccept(root.transition.source);
     if (startTerm != null || startAtFirstTerm) {
@@ -118,7 +137,7 @@ public class IntersectBlockReader extends BlockReader {
       Node node = getCurrentNode();
       while (true) {
         if (node.isArcIterationOver()) {
-          //if (debug) System.out.println("pop node [" + node.depth + "]");
+          if (debug) System.out.println("pop node [" + node.depth + "]");
           node = popNode();
           if (node == null) {
             // End of enumeration.
@@ -145,9 +164,9 @@ public class IntersectBlockReader extends BlockReader {
           followArc(node);
           break;
         }
-        //if (debug) System.out.println("[" + node.depth + "] no transitions match arc " + node.toString(node.arc));
+        if (debug) System.out.println("[" + node.depth + "] no transitions match arc " + node.toString(node.arc));
         if (node.isTransitionIterationOver()) {
-          //if (debug) System.out.println("[" + node.depth + "] no more transitions");
+          if (debug) System.out.println("[" + node.depth + "] no more transitions");
           break;
         }
         recordLastSkippedArc(node);
@@ -168,7 +187,7 @@ public class IntersectBlockReader extends BlockReader {
     } else {
       seekStartOption = SeekStartOption.REGULAR;
     }
-    //if (debug) System.out.println("seek start term \"" + (UTF8_TO_STRING ? startTerm.utf8ToString() : startTerm) + "\"" + (seekStartOption == SeekStartOption.REGULAR ? "" : " " + seekStartOption));
+    if (debug) System.out.println("seek start term \"" + (UTF8_TO_STRING ? startTerm.utf8ToString() : startTerm) + "\"" + (seekStartOption == SeekStartOption.REGULAR ? "" : " " + seekStartOption));
     Node node = getCurrentNode();
     int startTermIndex = startTerm.offset;
     int startTermEnd = startTerm.offset + startTerm.length;
@@ -244,7 +263,7 @@ public class IntersectBlockReader extends BlockReader {
       node = popNode();
       startTermIndex--;
     }
-    //if (debug) System.out.println("start term before first");
+    if (debug) System.out.println("start term before first");
     stackNode().asRoot();
   }
 
@@ -253,7 +272,7 @@ public class IntersectBlockReader extends BlockReader {
         startTerm = EMPTY_BYTES_REF;
     }
     SeekStatus seekStatus = seekInBlock(startTerm, blockFP);
-    //if (debug) System.out.println("seek in block FP=" + blockFP + " status=" + seekStatus);
+    if (debug) System.out.println("seek in block FP=" + blockFP + " status=" + seekStatus);
     switch (seekStatus) {
       case FOUND:
         if (seekStartOption != SeekStartOption.REGULAR) {
@@ -268,7 +287,7 @@ public class IntersectBlockReader extends BlockReader {
           // The block line is positioned on the next term which is accepted by the automaton, so we have to return it once.
           returnStartTermOnce = true;
         }
-        //if (debug) System.out.println("positioned on term \"" + term.utf8ToString() + "\"" + (returnStartTermOnce ? " return start term once" : ""));
+        if (debug) System.out.println("positioned on term \"" + term.utf8ToString() + "\"" + (returnStartTermOnce ? " return start term once" : ""));
         break;
       case END:
         return;
@@ -280,6 +299,29 @@ public class IntersectBlockReader extends BlockReader {
     setCommonPrefix(node);
   }
 
+  private boolean atLeastOneTermAcceptedInBlock;//nocommit
+  private boolean atLeastOneCommonPrefixAcceptedInBlock;
+  public static volatile long numBlocksOpened;
+  public static volatile long numBlocksFullyRejected;
+  public static volatile long numBlocksCommonPrefixNeverMatches;
+  private boolean firstBlockOpened_;
+
+  private String transitionsToString() {
+    StringBuilder builder = new StringBuilder();
+    transitionsToString(0, "", builder);
+    return builder.toString();
+  }
+
+  private void transitionsToString(int state, String indent, StringBuilder builder) {
+    Transition t = new Transition();
+    int numT = automaton.initTransition(state, t);
+    for (int i = 0; i < numT; i++) {
+      automaton.getNextTransition(t);
+      builder.append('\n').append(indent).append(t);
+      transitionsToString(t.dest, indent + " ", builder);
+    }
+  }
+
   private BytesRef findNextMatchingTermInBlock() throws IOException {
     assert blockHeader != null;
     if (returnStartTermOnce) {
@@ -289,13 +331,34 @@ public class IntersectBlockReader extends BlockReader {
     termLoop:
     while (true) {
       if (readLineInBlock() == null) {
-        // No more line in the block.
+        // No more lines in the block.
+
+        synchronized (IntersectBlockReader.class) {//nocommit
+          numBlocksOpened++;
+          if (firstBlockOpened_) {
+            if (!atLeastOneTermAcceptedInBlock) {
+              numBlocksFullyRejected++;
+            }
+            if (!atLeastOneCommonPrefixAcceptedInBlock) {
+              if (debug) {
+                System.out.println("commonPrefix=" + commonPrefix.utf8ToString());
+                System.out.println(transitionsToString());
+              }
+              numBlocksCommonPrefixNeverMatches++;
+            }
+          } else {
+            firstBlockOpened_ = true;
+          }
+        }
+        atLeastOneTermAcceptedInBlock = false;
+        atLeastOneCommonPrefixAcceptedInBlock = false;
+
         matchIndex = 0;
         long blockFP = blockInput.getFilePointer();
         if (blockFP > endBlockFP) {
           // Exit either if we completed the single block to read, or the last block of the series.
           scanPreviousBlock = false;
-          //if (debug) System.out.println("end of block");
+          if (debug) System.out.println("end of block");
           return null;
         }
         if (scanPreviousBlock) {
@@ -303,7 +366,7 @@ public class IntersectBlockReader extends BlockReader {
           setCommonPrefix(getCurrentNode());
         }
         // Scan the next block starting at the current file pointer in the block file.
-        //if (debug) System.out.println("open next block FP=" + blockFP);
+        if (debug) System.out.println("open next block FP=" + blockFP);
         initializeHeader(null, blockFP);
         if (blockHeader == null) {
           throw newCorruptIndexException("Illegal absence of block", blockFP);
@@ -315,6 +378,12 @@ public class IntersectBlockReader extends BlockReader {
       byte[] bytes = term.bytes;
       assert term.offset == 0;
       int length = term.length;
+
+      if (StringHelper.startsWith(term, commonPrefix)) {
+        atLeastOneCommonPrefixAcceptedInBlock = true;
+      }
+
+      matchIndex = Math.max(Math.min(termBytes.getSuffixOffset(), matchIndex), commonPrefixIndex);
       if (commonSuffix != null) {
         int suffixLength = commonSuffix.length;
         int offset = length - suffixLength;
@@ -328,14 +397,12 @@ public class IntersectBlockReader extends BlockReader {
           }
         }
       }
-      matchIndex = Math.max(Math.min(termBytes.getSuffixOffset(), matchIndex), commonPrefixIndex);
       int state = matchStates[matchIndex];
       while (matchIndex < length) {
         state = runAutomaton.step(state, bytes[matchIndex] & 0xff);
         if (state == -1) {
           // No match.
-          assert !runAutomaton.run(bytes, 0, length);
-          //if (debug) System.out.println("reject \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
+          if (debug) System.out.println("reject \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
           continue termLoop;
         }
         if (++matchIndex == matchStates.length) {
@@ -345,13 +412,12 @@ public class IntersectBlockReader extends BlockReader {
       }
       if (runAutomaton.isAccept(state)) {
         // Match.
-        assert runAutomaton.run(bytes, 0, length);
-        //if (debug) System.out.println("accept \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
+        if (debug) System.out.println("accept \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
+        atLeastOneTermAcceptedInBlock = true;
         return term;
       }
       // No match.
-      assert !runAutomaton.run(bytes, 0, length);
-      //if (debug) System.out.println("reject \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
+      if (debug) System.out.println("reject \"" + (UTF8_TO_STRING ? term.utf8ToString() : term) + "\"");
     }
   }
 
@@ -367,24 +433,22 @@ public class IntersectBlockReader extends BlockReader {
       nextArcLabel = node.nextArc.label();
       ceilMatch = false;
     }
-    //if (debug) System.out.println("[" + node.depth + "] iterate arc=" + node.toString(node.arc) + " nextArc=" + (nextArcLabel == Integer.MAX_VALUE ? "-" : node.toString(node.nextArc)));
+    if (debug) System.out.println("[" + node.depth + "] iterate arc=" + node.toString(node.arc) + " nextArc=" + (nextArcLabel == Integer.MAX_VALUE ? "-" : node.toString(node.nextArc)));
 
     // Special case of no transitions which can accept a first final arc and floor match.
     if (node.drainNoTransitionState()) {
-      //if (debug) System.out.println("node has no transition");
+      if (debug) System.out.println("node has no transition");
       return matchResult.reset(-1, node.isFirstArc(), ceilMatch);
     }
-    boolean floorMatchFirstArc = node.requiresFloorMatch;
-    boolean destinationAccepted = runAutomaton.isAccept(node.transition.dest);
+    boolean floorMatchIfFirstArc = node.requiresFloorMatch;
 
     // Skip all transitions before the arc label.
     while (node.transition.max < arcLabel) {
-      floorMatchFirstArc = true;
+      floorMatchIfFirstArc = true;
       if (!node.nextTransition()) {
-        //if (debug) System.out.println("skipped all transitions");
-        return matchResult.reset(-1, destinationAccepted || node.isFirstArc(), ceilMatch);
+        if (debug) System.out.println("skipped all transitions");
+        return matchResult.reset(-1, node.isFirstArc(), ceilMatch);
       }
-      destinationAccepted |= runAutomaton.isAccept(node.transition.dest);
     }
 
     // Iterate the transitions matching this arc.
@@ -392,17 +456,19 @@ public class IntersectBlockReader extends BlockReader {
     // - A transition matching exactly the arc label (transition.min <= arcLabel <= transition.max).
     // - One or more transitions ceil matching the arc (transition.min < nextArcLabel && transition.max > arcLabel).
     int exactMatchState = -1;
+    boolean destinationAccepted = false;
     int min;
     while ((min = node.transition.min) < nextArcLabel) {
       if (min <= arcLabel) {
         exactMatchState = node.transition.dest;
+        destinationAccepted = runAutomaton.isAccept(exactMatchState);
         if (min < arcLabel) {
-          floorMatchFirstArc = true;
+          floorMatchIfFirstArc = true;
         }
         if (ceilMatch || node.transition.max > arcLabel) {
           if (exactMatchState == node.transition.source && min == 0 && node.transition.max == 255) {
             // Special case of wildcard suffix detected (e.g. PrefixQuery automaton).
-            return matchResult.resetForWildcard(floorMatchFirstArc);
+            return matchResult.resetForWildcard(floorMatchIfFirstArc);
           }
           ceilMatch = true;
           break;
@@ -414,9 +480,8 @@ public class IntersectBlockReader extends BlockReader {
       if (!node.nextTransition()) {
         break;
       }
-      destinationAccepted |= runAutomaton.isAccept(node.transition.dest);
     }
-    boolean floorMatch = destinationAccepted || floorMatchFirstArc && node.isFirstArc();
+    boolean floorMatch = destinationAccepted || floorMatchIfFirstArc && node.isFirstArc();
     return matchResult.reset(exactMatchState, floorMatch, ceilMatch);
   }
 
@@ -429,12 +494,12 @@ public class IntersectBlockReader extends BlockReader {
   private void followArc(Node node) throws IOException {
     if (node.arc.label() == FST.END_LABEL) {
       // Final node. Open the corresponding term block to prepare to scan it.
-      //if (debug) System.out.println("[" + node.depth + "] follow final arc");
+      if (debug) System.out.println("[" + node.depth + "] follow final arc");
       long blockFP = outputs.add(node.output, node.arc.output());
       openBlocks(node, maybePreviousBlockFP(node, blockFP), blockFP);
       node.nextArc(); // Continue the iteration from the next arc when we pop back this node from the stack.
     } else if (matchResult.wildcardSuffix) {
-      //if (debug) System.out.println("[" + node.depth + "] follow wildcard suffix");
+      if (debug) System.out.println("[" + node.depth + "] follow wildcard suffix");
       matchResult.wildcardSuffix = false;
       node.requiresFloorMatch = matchResult.floorMatch;
       node.requiresCeilMatch = false;
@@ -442,14 +507,14 @@ public class IntersectBlockReader extends BlockReader {
       node.exhaustArcIteration(); // Exhaust this node arcs (no remaining arcs to follow/skip).
     } else {
       // Non-leaf node. Advance deeper in the FST tree, stack the child node.
-      //if (debug) System.out.println("[" + node.depth + "] follow " + node.toString(node.arc) + " " + matchResult + " node.output=" + node.output + " arc.output=" + node.arc.output());
+      if (debug) System.out.println("[" + node.depth + "] follow " + node.toString(node.arc) + " " + matchResult + " node.output=" + node.output + " arc.output=" + node.arc.output());
       stackNode().follow(node, matchResult);
       node.nextArc(); // Continue the iteration from the next arc when we pop back this node from the stack.
     }
   }
 
   private boolean followRemainingArcs(Node node) throws IOException {
-    //if (debug) System.out.println("[" + node.depth + "] follow remaining arcs");
+    if (debug) System.out.println("[" + node.depth + "] follow remaining arcs");
     boolean followed = false;
     boolean floorMatch = node.requiresFloorMatch && !node.onlyFloorOrCeil && node.isFirstArc();
     if (floorMatch && !node.requiresCeilMatch) {
@@ -477,7 +542,7 @@ public class IntersectBlockReader extends BlockReader {
   }
 
   private void recordLastSkippedArc(Node node) {
-    //if (debug) System.out.println("[" + node.depth + "] record skipped arc " + node.toString(node.arc) + " node.output=" + node.output + " arc.output=" + node.arc.output());
+    if (debug) System.out.println("[" + node.depth + "] record skipped arc " + node.toString(node.arc) + " node.output=" + node.output + " arc.output=" + node.arc.output());
     lastSkippedArc.copyFrom(node.arc);
     lastSkippedArcOutput = node.output;
   }
@@ -500,7 +565,7 @@ public class IntersectBlockReader extends BlockReader {
 
   private void followFloorArcs(Node node, boolean isAlreadyOnFirstArc) throws IOException {
     assert !isAlreadyOnFirstArc || node.isFirstArc();
-    //if (debug) System.out.println("[" + node.depth + "] follow floor arcs");
+    if (debug) System.out.println("[" + node.depth + "] follow floor arcs");
     if (isAlreadyOnFirstArc) {
       scratchArc.copyFrom(node.arc);
     } else {
@@ -511,7 +576,7 @@ public class IntersectBlockReader extends BlockReader {
 
   private void followCeilArcs(Node node, boolean isAlreadyOnLastArc) throws IOException {
     assert !isAlreadyOnLastArc || node.isLastArc();
-    //if (debug) System.out.println("[" + node.depth + "] follow ceil arcs");
+    if (debug) System.out.println("[" + node.depth + "] follow ceil arcs");
     if (isAlreadyOnLastArc) {
       scratchArc.copyFrom(node.arc);
     } else {
@@ -585,11 +650,11 @@ public class IntersectBlockReader extends BlockReader {
 
   private long maybePreviousBlockFP(Node node, long startBlockFP) throws IOException {
     assert !scanPreviousBlock;
-    //if (debug) System.out.println("previous block check floorMatch=" + node.requiresFloorMatch + " startFP=" + startBlockFP + " inputFP=" + blockInput.getFilePointer() + " skippedOutput=" + lastSkippedArcOutput);
+    if (debug) System.out.println("previous block check floorMatch=" + node.requiresFloorMatch + " startFP=" + startBlockFP + " inputFP=" + blockInput.getFilePointer() + " skippedOutput=" + lastSkippedArcOutput);
     if (node.requiresFloorMatch && startBlockFP != blockInput.getFilePointer() && lastSkippedArcOutput != null) {
       long lastSkippedBlockFP = getCeilBlockFP(lastSkippedArc, lastSkippedArcOutput);
       lastSkippedArcOutput = null;
-      //if (debug) System.out.println("needs previous block previousFP=" + lastSkippedBlockFP + " startFP=" + startBlockFP);
+      if (debug) System.out.println("needs previous block previousFP=" + lastSkippedBlockFP + " startFP=" + startBlockFP);
       assert lastSkippedBlockFP < startBlockFP;
       startBlockFP = lastSkippedBlockFP;
       scanPreviousBlock = true;
@@ -600,7 +665,7 @@ public class IntersectBlockReader extends BlockReader {
   private void openBlocks(Node node, long startBlockFP, long endBlockFP) throws IOException {
     assert startBlockFP <= endBlockFP;
     assert blockFPAlwaysIncreases(startBlockFP);
-    //if (debug) System.out.println("open blocks startFP=" + startBlockFP + " endFP=" + endBlockFP + " inputFP=" + blockInput.getFilePointer());
+    if (debug) System.out.println("open blocks startFP=" + startBlockFP + " endFP=" + endBlockFP + " inputFP=" + blockInput.getFilePointer());
     initializeHeader(null, startBlockFP);
     if (blockHeader == null) {
       throw newCorruptIndexException("Illegal absence of block", startBlockFP);
@@ -688,7 +753,7 @@ public class IntersectBlockReader extends BlockReader {
       assert !node.onlyFloorOrCeil;
       reset(node.arc, node.output, matchResult.exactMatchState, matchResult.floorMatch, matchResult.ceilMatch);
       setCommonPrefix(node);
-      //if (debug) System.out.println("[" + depth + "] stack node" + (onlyFloorOrCeil ? " onlyFloorOrCeil" : "") + " common prefix index=" + commonPrefixIndex + " state=" + commonPrefixState + " output=" + output);
+      if (debug) System.out.println("[" + depth + "] stack node" + (onlyFloorOrCeil ? " onlyFloorOrCeil" : "") + " common prefix index=" + commonPrefixIndex + " state=" + commonPrefixState + " output=" + output);
       return this;
     }
 

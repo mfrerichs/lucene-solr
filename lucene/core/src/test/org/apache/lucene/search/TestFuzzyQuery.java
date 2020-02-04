@@ -28,6 +28,7 @@ import java.util.Set;
 import com.carrotsearch.randomizedtesting.RandomizedTest;
 import org.apache.lucene.analysis.MockAnalyzer;
 import org.apache.lucene.analysis.MockTokenizer;
+import org.apache.lucene.codecs.uniformsplit.IntersectBlockReader;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StringField;
@@ -678,6 +679,10 @@ public class TestFuzzyQuery extends LuceneTestCase {
     }
     
     IOUtils.close(r, w, dir);
+
+    System.out.println("IntersectBlockReader.numBlocksOpened=" + IntersectBlockReader.numBlocksOpened);//nocommit
+    System.out.println("IntersectBlockReader.numBlocksFullyRejected=" + IntersectBlockReader.numBlocksFullyRejected + " (" + ((double) IntersectBlockReader.numBlocksFullyRejected / IntersectBlockReader.numBlocksOpened * 100) + " %)");
+    System.out.println("IntersectBlockReader.numBlocksCommonPrefixNeverMatches=" + IntersectBlockReader.numBlocksCommonPrefixNeverMatches + " (" + ((double) IntersectBlockReader.numBlocksCommonPrefixNeverMatches / IntersectBlockReader.numBlocksOpened * 100) + " %)");
   }
 
   private static class TermAndScore implements Comparable<TermAndScore> {
